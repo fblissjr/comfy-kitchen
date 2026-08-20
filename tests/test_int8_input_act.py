@@ -245,6 +245,12 @@ class TestGatedInputAct:
         assert err_fused <= max(err_chain * 1.05, 1e-4), (
             f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
         )
+        # Storage-dtype rounding must match gelu/silu-then-quantize, otherwise
+        # the row scale moves and every INT8 code on the row can change.
+        if act == "swiglu" and dtype in (torch.float16, torch.bfloat16):
+            assert torch.equal(fused_q, chain_q), (
+                f"{dtype} fused INT8 codes differ from the eager chain"
+            )
         assert fused_q.shape == (m, k)
         assert fused_q.dtype == torch.int8
         assert fused_s.shape == (m, 1)
@@ -273,8 +279,11 @@ class TestGatedInputAct:
             )
 
         assert got.shape == (m, n)
-        rel = rel_err(got, ref)
-        assert rel < 0.05, f"{backend}: rel={rel:.3e}"
+        if act == "swiglu" and backend == "cuda" and device == "cuda":
+            assert torch.equal(got, ref), f"{backend}: fused output is not bit-exact"
+        else:
+            rel = rel_err(got, ref)
+            assert rel < 0.05, f"{backend}: rel={rel:.3e}"
 
     @pytest.mark.parametrize(
         "tag,shape,kwargs",

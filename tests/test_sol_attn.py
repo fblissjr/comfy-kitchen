@@ -811,3 +811,26 @@ def test_blk_cnt_hip_refuses():
     q, k, v = _qkv(1, t, h)
     with pytest.raises(NotImplementedError):
         hip_backend.sol_attn(q, k, v, tau=1.0, blk_cnt=_counts(1, h, t))
+
+
+def test_blk_cnt_chunked_producer():
+    """The chunked producer fills the same count buffer from its own launch:
+    bounded like the direct path, identical at the routed-everything extreme,
+    and close at the shipped tau (its threshold comes from last step's K-mean,
+    so a few near-threshold rows may flip -- reported, not gated)."""
+    c = _chunked_case(seed=17, rot=96)
+    t, h, n = c["t"], c["h"], (c["t"] + 63) // 64
+    cnt = torch.empty(1, h, n, dtype=torch.int32, device="cuda")
+    out, km, vs = cuda_backend.sol_attn_chunked(c["chunks"], t, h, c["freqs"], c["norm"], tau=-1e9, blk_cnt=cnt)
+    assert bool((cnt == n).all())
+    cnt_d = torch.empty(1, h, n, dtype=torch.int32, device="cuda")
+    cuda_backend.sol_attn(c["q"], c["k"], c["v"], tau=1.0, blk_cnt=cnt_d)
+    cnt_c = torch.empty(1, h, n, dtype=torch.int32, device="cuda")
+    cuda_backend.sol_attn_chunked(c["chunks"], t, h, c["freqs"], c["norm"], kmean=km, vscale=vs, tau=1.0, blk_cnt=cnt_c)
+    assert 1 <= int(cnt_c.min()) and int(cnt_c.max()) <= n
+    agree = float((cnt_c == cnt_d).float().mean())
+    print(f"\nchunked vs direct counts at tau 1.0: {agree:.3f} of rows equal, "
+          f"max |diff| {int((cnt_c - cnt_d).abs().max())}")
+    with pytest.raises(ValueError, match="blk_cnt"):
+        cuda_backend.sol_attn_chunked(c["chunks"], t, h, c["freqs"], c["norm"], tau=1.0,
+                                      blk_cnt=torch.empty(1, h, n + 1, dtype=torch.int32, device="cuda"))

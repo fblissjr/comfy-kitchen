@@ -864,15 +864,19 @@ def test_blk_cnt_topk_lower_bound_and_ties():
         cnt = _counts(1, h, t)
         ck.sol_attn(q, k, v, topk_ratio=0.25, sink_blocks=list(sb), blk_cnt=cnt)
         assert bool((cnt >= sb[1] - sb[0] + kk).all()), sb
-    # the tied fixture: blocks 8..31 identical and highest for every query
+    # the tied fixture from test_topk_ties_over_select: blocks 8..31 identical.
+    # On a query block where that group scores highest, the boundary falls
+    # inside it and all 24 are kept; on one where it does not, the count is
+    # k plus the diagonal. Both happen here, so the spread is the evidence.
     u = q.mean(dim=1, keepdim=True) * 640
     kt = k.clone()
     kt[:, 8 * 64:] = u
     cnt = _counts(1, h, t)
     ck.sol_attn(q, kt, v, topk_ratio=0.25, tail=False, blk_cnt=cnt)
     kk = _topk_count(n, 0.25)
-    assert kk == 8 and bool((cnt >= 24).all())          # the whole tie group, not k
-    assert 24 > kk + 3                                  # so [k, k+3] is not a bound
+    assert kk == 8 and bool((cnt >= kk).all())
+    assert int(cnt.max()) >= 24 > kk + 3                # a whole tie group kept: no [k, k+3] bound
+    assert int(cnt.min()) <= kk + 3                     # and a row where it was not on top
 
 
 def test_blk_cnt_mid_tau_eager_disagreement_is_reported_not_gated(capsys):

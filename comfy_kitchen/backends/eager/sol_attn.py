@@ -271,7 +271,7 @@ def _op_sol_attn(
     tail: bool,
     block_len: torch.Tensor | None,
     coarse_gate: torch.Tensor | None,
-    blk_cnt: torch.Tensor | None,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
@@ -286,6 +286,6 @@ def _op_sol_attn(
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
-                      key_bias, topk_ratio, tail, block_len, coarse_gate, blk_cnt):
+                      key_bias, topk_ratio, tail, block_len, coarse_gate, blk_cnt=None):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

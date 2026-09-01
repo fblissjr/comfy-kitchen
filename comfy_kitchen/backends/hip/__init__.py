@@ -1867,6 +1867,7 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -1875,7 +1876,15 @@ def sol_attn(
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block (sinks
     and the diagonal still ride on top). tau is ignored then.
+
+    ``blk_cnt`` is accepted for signature parity with the CUDA backend and
+    refused when given: the HIP plan carries the same ``cnt`` slot, but the
+    slice has not been verified on an AMD device and a wrong slice would be a
+    silent wrong number rather than an error.
     """
+    if blk_cnt is not None:
+        raise NotImplementedError(
+            "sol_attn: blk_cnt is not implemented on the HIP backend yet; pass None")
     batch, t, h, d = q.shape
     if q.dtype != torch.bfloat16:
         raise ValueError(f"sol_attn: q/k/v must be bfloat16, got {q.dtype}")

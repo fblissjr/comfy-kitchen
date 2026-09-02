@@ -850,6 +850,32 @@ def test_blk_cnt_monotone_in_tau():
     assert strict
 
 
+def test_blk_cnt_batch_layout_matches_individual_calls():
+    """B=1 cannot expose a mistaken batch stride in the workspace slice.
+    A batched launch must return the same output and count tensor as the two
+    samples launched independently, including when their routes differ."""
+    b, t, h = 2, 1024 + 40, 4
+    q, k, v = _qkv(b, t, h)
+    n = (t + 63) // 64
+    kw = {"tau": 1.0, "sink_blocks": [0, 3], "sink_q": [5, 7]}
+
+    batched = _counts(b, h, t)
+    out_batched = ck.sol_attn(q, k, v, blk_cnt=batched, **kw)
+
+    individual, outputs = [], []
+    for i in range(b):
+        count = _counts(1, h, t)
+        outputs.append(ck.sol_attn(q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                                   blk_cnt=count, **kw))
+        individual.append(count)
+
+    assert torch.equal(out_batched, torch.cat(outputs))
+    assert torch.equal(batched, torch.cat(individual))
+    assert bool((batched[0] != batched[1]).any()), (
+        "fixture did not distinguish the two batch slices")
+    assert batched.shape == (b, h, n)
+
+
 def test_blk_cnt_topk_lower_bound_and_ties():
     """Top-k keeps at least k non-sink blocks per query block plus the sinks.
     There is no universal upper bound: a tied group straddling the boundary is

@@ -11,6 +11,7 @@ HIP on ROCm. The two carry different internal layouts and the same contract, so
 the suite is the contract.
 """
 
+import inspect
 import math
 
 import pytest
@@ -1152,6 +1153,8 @@ def test_blk_cnt_chunked_producer():
     bounded like the direct path, identical at the routed-everything extreme,
     and close at the shipped tau (its threshold comes from last step's K-mean,
     so a few near-threshold rows may flip -- reported, not gated)."""
+    if backend is not cuda_backend:
+        pytest.skip("CUDA backend only; HIP refuses blk_cnt")
     c = _chunked_case(seed=17, rot=96)
     t, h, n = c["t"], c["h"], (c["t"] + 63) // 64
     cnt = torch.empty(1, h, n, dtype=torch.int32, device="cuda")
@@ -1168,3 +1171,23 @@ def test_blk_cnt_chunked_producer():
     with pytest.raises(ValueError, match="blk_cnt"):
         cuda_backend.sol_attn_chunked(c["chunks"], t, h, c["freqs"], c["norm"], tau=1.0,
                                       blk_cnt=torch.empty(1, h, n + 1, dtype=torch.int32, device="cuda"))
+
+
+def test_blk_cnt_chunked_is_keyword_only():
+    """The count buffer sits behind ``*`` on both backends, so the positional
+    tail stays exactly as upstream declares it and a later keyword-only
+    parameter cannot collide with it."""
+    for fn in (cuda_backend.sol_attn_chunked, hip_backend.sol_attn_chunked):
+        param = inspect.signature(fn).parameters["blk_cnt"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is None
+
+
+def test_blk_cnt_chunked_hip_refuses():
+    """Same refusal as the direct path: the slice is unverified on AMD."""
+    if backend is not hip_backend:
+        pytest.skip("HIP backend only")
+    c = _chunked_case(seed=17, rot=96)
+    with pytest.raises(NotImplementedError):
+        hip_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
+                                     tau=1.0, blk_cnt=_counts(1, c["h"], c["t"]))

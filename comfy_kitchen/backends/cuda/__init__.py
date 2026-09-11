@@ -2570,15 +2570,17 @@ def sol_attn_chunked(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    *,
     blk_cnt: torch.Tensor | None = None,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
-    ``blk_cnt``: optional int32 ``(1, H, ceil(T/64))`` on the device, filled from
-    the same launch with the routed-block count per query block (sinks and the
-    diagonal included, sink_q rows at ceil(T/64)), as ``sol_attn`` does.
+    ``blk_cnt`` (keyword-only): optional int32 ``(1, H, ceil(T/64))`` on the
+    device, filled from the same launch with the routed-block count per query
+    block (sinks and the diagonal included, sink_q rows at ceil(T/64)), as
+    ``sol_attn`` does.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the

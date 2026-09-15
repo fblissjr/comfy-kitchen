@@ -152,6 +152,7 @@ def sol_attn(
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
+    rotate: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -209,6 +210,16 @@ def sol_attn(
             The eager reference applies the same rescale, which is a no-op
             for its full-precision arithmetic. Off by default; the CUDA
             backend only (HIP refuses True).
+        rotate: Rotate every q and k row by one fixed orthogonal matrix (a
+            random sign diagonal, then the normalized Hadamard H128) before
+            INT8 quantization, so a row's energy is spread evenly over its
+            128 channels and neither a loud channel nor a single spike sets
+            the one scale the row shares. Every q.k score is unchanged; the
+            routing threshold and the coarse branch are computed unrotated.
+            The structural form of ``qk_balance`` (the two compose, and with
+            rotation on the factor buys little). The same transform
+            comfy-kitchen's ``int8_attention`` applies. Off by default; the
+            CUDA backend only (HIP refuses True).
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -225,6 +236,7 @@ def sol_attn(
         int(token_aug),
         blk_cnt,
         bool(qk_balance),
+        bool(rotate),
     )
 
 

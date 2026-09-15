@@ -2633,6 +2633,7 @@ def sol_attn(
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
+    rotate: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
@@ -2653,6 +2654,12 @@ def sol_attn(
     INT8 quantizers, q by f and k by 1/f, so the loud channels of a head's
     K stop setting the one scale its 128 channels share. See the public
     docstring; sage_attention/sol_layout.cuh holds the factor's constants.
+
+    ``rotate``: multiply every q and k row by one fixed orthogonal matrix (a
+    sign diagonal then the normalized Hadamard H128) before the INT8
+    quantizers, so a row's energy is spread across its channels and no loud
+    channel or single spike sets the row's scale. Exact for q.k. See the
+    public docstring.
     """
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -2708,6 +2715,7 @@ def sol_attn(
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
         tail=bool(tail), token_aug=int(token_aug), qk_balance=bool(qk_balance),
+        rotate=bool(rotate),
     )
     if blk_cnt is not None:
         # The route stage left one int32 per (b, h, query block) in the plan's

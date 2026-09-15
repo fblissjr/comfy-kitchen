@@ -287,7 +287,7 @@ extern "C" {
         int64_t qs_b, int64_t qs_t, int64_t qs_h,
         int64_t ks_b, int64_t ks_t, int64_t ks_h,
         int64_t vs_b, int64_t vs_t, int64_t vs_h,
-        int n_tok, int qk_balance, cudaStream_t stream);
+        int n_tok, int qk_balance, int rotate, cudaStream_t stream);
 
     // fp16-accumulate NDHWC conv3d with fused bias/residual — see ops/cutlass_conv3d_fp16.cu.
     // resid is a full NZPQK tensor (resid_full) or a K-vector broadcast to every row.
@@ -1575,7 +1575,7 @@ void sol_attn(
     std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
-    bool tail = true, int64_t token_aug = 0, bool qk_balance = false)
+    bool tail = true, int64_t token_aug = 0, bool qk_balance = false, bool rotate = false)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
@@ -1604,7 +1604,7 @@ void sol_attn(
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2), (int)token_aug, qk_balance ? 1 : 0, stream);
+        v.stride(0), v.stride(1), v.stride(2), (int)token_aug, qk_balance ? 1 : 0, rotate ? 1 : 0, stream);
 }
 
 void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
@@ -4405,7 +4405,7 @@ NB_MODULE(_C, m) {
           nb::arg("threshold") = nb::none(),
           nb::arg("block_len") = nb::none(),
           nb::arg("tail") = true, nb::arg("token_aug") = 0,
-          nb::arg("qk_balance") = false);
+          nb::arg("qk_balance") = false, nb::arg("rotate") = false);
 
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"),

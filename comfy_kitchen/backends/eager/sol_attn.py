@@ -20,6 +20,10 @@ _LOG2E = 1.4426950408889634
 QK_BALANCE_ALPHA = 0.5
 QK_BALANCE_MIN_SHARE = 0.2
 QK_BALANCE_TOP = 4
+# rotate: sage_attention/sol_layout.cuh (ROT_SIGNS, rot128_serial) is the same
+# matrix: sign diagonal from these four words, then the normalized
+# Sylvester-Hadamard H128 (the product of the seven butterfly stages).
+ROT_SIGNS = (0x1035997B, 0x8087F5EE, 0xEE2E4E1A, 0x71132418)
 # Past this the caller almost certainly wanted a fused backend and got
 # silently downgraded; a clear error beats an allocator failure.
 _MAX_SCORE_BYTES = 4 * 2**30
@@ -122,6 +126,24 @@ def _pool(x: torch.Tensor, n_blocks: int, reduce: str, lengths=None) -> torch.Te
     return blocks.sum(dim=2) / lengths.view(1, -1, 1, 1)
 
 
+def rotation_matrix(device=None, dtype=torch.float32) -> torch.Tensor:
+    """The fixed 128x128 orthogonal matrix the fused backend rotates q and k
+    rows by under ``rotate``: ``R = diag(sign) @ H128 / sqrt(128)``. Rows of q
+    and k are right-multiplied by it, so ``(q @ R) @ (k @ R).T == q @ k.T``."""
+    sign = torch.tensor([1.0 if (ROT_SIGNS[d >> 5] >> (d & 31)) & 1 else -1.0 for d in range(128)],
+                        dtype=dtype, device=device)
+    h2 = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=dtype, device=device)
+    h = h2
+    for _ in range(6):
+        h = torch.kron(h, h2)
+    return torch.diag(sign) @ h / (128 ** 0.5)
+
+
+def hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    """``x @ R`` on the last (channel) axis, fp32."""
+    return x.float() @ rotation_matrix(x.device)
+
+
 def qk_balance_factor(q: torch.Tensor, k: torch.Tensor, lengths=None):
     """The per-(batch, head, channel) q/k balance the fused backend applies
     inside its INT8 quantizers, as ``(f for q, 1/f for k)``, fp32
@@ -166,6 +188,7 @@ def sol_attn(
                           # block selection, so there is no token routing stage to model
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
+    rotate: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
@@ -183,7 +206,9 @@ def sol_attn(
     ``qk_balance`` applies the fused backends' per-channel q/k rescale
     (``qk_balance_factor``) to the fp32 inputs; every score and the threshold
     are the same in exact arithmetic, so this is an identity up to fp32
-    rounding here and a different quantization there.
+    rounding here and a different quantization there. ``rotate`` likewise
+    applies the fused backends' fixed orthogonal rotation (``hadamard_rotate``)
+    to the fp32 q and k, another identity here.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
@@ -226,6 +251,15 @@ def sol_attn(
     if qk_balance:
         bq, bk = qk_balance_factor(fq, fk, lengths if block_len is not None else None)
         fq, fk = fq * bq, fk * bk
+    # The routing threshold (tau sigma of the proxy row, from per-channel
+    # variances) is a diagonal approximation: invariant under a per-channel
+    # rescale, NOT under a rotation that mixes channels. The fused backend
+    # computes it from the unrotated tensors, so this reference does too.
+    fq_thr, fk_thr = fq, fk
+    if rotate:
+        if d != 128:
+            raise ValueError(f"sol_attn: rotate needs head_dim 128, got {d}")
+        fq, fk = hadamard_rotate(fq), hadamard_rotate(fk)
     kc = _pool(fk, n, "mean", lengths)              # (B, N, H, D) summary keys
     vc = _pool(fv, n, "sum", lengths)               # (B, N, H, D) summed values
 
@@ -233,8 +267,12 @@ def sol_attn(
     k_mean = kc.mean(dim=1, keepdim=True)           # (B, 1, H, D)
     kcc = kc - k_mean
     kc_var = kcc.pow(2).mean(dim=1)                 # (B, H, D)
+    if rotate:   # threshold statistics from the unrotated keys (see above)
+        kc_thr = _pool(fk_thr, n, "mean", lengths)
+        kc_var = (kc_thr - kc_thr.mean(dim=1, keepdim=True)).pow(2).mean(dim=1)
 
     centroid = _pool(fq, n, "mean", lengths)                        # (B, N, H, D)
+    centroid_thr = _pool(fq_thr, n, "mean", lengths) if rotate else centroid
 
     qh = fq.permute(0, 2, 1, 3)                                     # (B, H, T, D)
     kh = (fk - k_mean).permute(0, 2, 1, 3)
@@ -275,7 +313,7 @@ def sol_attn(
             exact = torch.zeros_like(ranked, dtype=torch.bool)
     else:
         # tau sigma of the proxy row, from the query-block centroid
-        var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)
+        var = (centroid_thr.pow(2) * kc_var.unsqueeze(1)).sum(-1)  # (B, N, H)
         thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
         exact = colmean > thr.permute(0, 2, 1).unsqueeze(-1)            # (B, H, NQ, N)
     exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
@@ -327,6 +365,7 @@ def _op_sol_attn(
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
+    rotate: bool = False,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
@@ -336,6 +375,7 @@ def _op_sol_attn(
         "token_aug": token_aug,
         "blk_cnt": blk_cnt,
         "qk_balance": qk_balance,
+        "rotate": rotate,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -344,6 +384,6 @@ def _op_sol_attn(
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
                       key_bias, topk_ratio, tail, block_len, coarse_gate,
-                      token_aug=0, blk_cnt=None, qk_balance=False):
+                      token_aug=0, blk_cnt=None, qk_balance=False, rotate=False):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

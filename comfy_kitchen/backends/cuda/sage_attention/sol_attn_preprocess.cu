@@ -120,13 +120,14 @@ __global__ void prep_pooled_quant(const float* __restrict__ kc,
                                   const float* __restrict__ kmean,
                                   const float* __restrict__ fk,   // [B*H, HD] balance, or null
                                   int8_t* __restrict__ kciP, float* __restrict__ kcs,
-                                  int NTB, int NPAD) {
+                                  int NTB, int NPAD, int rotate) {
     __shared__ float sred[HD];
     const int n = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
     const size_t o = ((size_t)bh * NPAD + n) * HD + d;
     const bool live = n < NTB;
     const float f = fk ? fk[(size_t)bh * HD + d] : 1.f;
-    const float x = live ? (kc[o] - kmean[(size_t)bh * HD + d]) * f : 0.f;
+    float x = live ? (kc[o] - kmean[(size_t)bh * HD + d]) * f : 0.f;
+    if (rotate) x = rot128_block(x, sred);
     const float sc = fmaxf(block_max128(fabsf(x), sred) / 127.0f, 1e-12f);
     if (d == 0) kcs[(size_t)bh * NPAD + n] = live ? sc : 0.f;
     kciP[((size_t)bh * NPAD + n) * HD + perm_d(d)] = live ? q8(x, 1.f / sc) : (int8_t)0;
@@ -199,7 +200,7 @@ __global__ void prep_q(const E* __restrict__ q, const float* __restrict__ kcvar,
                        const float* __restrict__ fq,   // [B*H, HD] balance, or null
                        const int32_t* __restrict__ blen,
                        int T, int H, int NQ, int NPAD, float tau, float log2s,
-                       int64_t sb, int64_t st, int64_t sh) {
+                       int64_t sb, int64_t st, int64_t sh, int rotate) {
     __shared__ __align__(16) E sQ[BLK * LD_TILE];
     __shared__ __align__(16) float sred[HD];
     __shared__ float sf[HD];
@@ -212,10 +213,11 @@ __global__ void prep_q(const E* __restrict__ q, const float* __restrict__ kcvar,
     __syncthreads();
     const size_t tok0 = (size_t)batch * T + t0;
     quant_q_rows(sQ, len, nrows, qiP + (tok0 * H + head) * HD, qs + tok0 * H + head, H,
-                 fq ? sf : nullptr);
+                 fq ? sf : nullptr, rotate != 0);
     __syncthreads();
     const size_t qrow = (size_t)bh * NQ + qb;
-    const float c = centroid_quant(sQ, len, sred, cen8 + qrow * HD, cens + qrow, sf[threadIdx.x]);
+    const float c = centroid_quant(sQ, len, sred, cen8 + qrow * HD, cens + qrow, sf[threadIdx.x],
+                                   rotate != 0);
     qmean[((size_t)bh * NPAD + qb) * HD + threadIdx.x] = c;
     __syncthreads();                       // sred held the centroid bytes
     const float var = block_sum128(c * c * kcvar[(size_t)bh * HD + threadIdx.x], sred);
@@ -230,7 +232,7 @@ __global__ void prep_k(const E* __restrict__ k, const float* __restrict__ kmean,
                        const float* __restrict__ fk,      // [B*H, HD] balance, or null
                        const int32_t* __restrict__ blen,
                        int T, int Tp, int H,
-                       int64_t sb, int64_t st, int64_t sh) {
+                       int64_t sb, int64_t st, int64_t sh, int rotate) {
     __shared__ __align__(16) E sK[BLK * LD_TILE];
     __shared__ float sf[HD];
     const int n = blockIdx.x, bh = blockIdx.y;
@@ -243,7 +245,7 @@ __global__ void prep_k(const E* __restrict__ k, const float* __restrict__ kmean,
     const size_t dst0 = (size_t)bh * Tp + n * BLK;
     quant_k_rows(sK, len, kmean + (size_t)bh * HD,
                  kbias ? kbias + (size_t)batch * T + t0 : nullptr,
-                 kiP + dst0 * HD, ksb + dst0, fk ? sf : nullptr);
+                 kiP + dst0 * HD, ksb + dst0, fk ? sf : nullptr, rotate != 0);
 }
 
 // ---- producer-path finish: pooled sums -> means, next-step kmean ----
@@ -295,7 +297,7 @@ void launch_sol_finish(
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(
         s.kc, s.kmean, nullptr, nullptr, s.kcvar, NTB, NPAD);
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
-        s.kc, s.kmean, nullptr, (int8_t*)kciP, (float*)kcs, NTB, NPAD);
+        s.kc, s.kmean, nullptr, (int8_t*)kciP, (float*)kcs, NTB, NPAD, 0);
     prep_thr_from_cen<<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const int8_t*)cen8, (const float*)cens, s.kcvar, (float*)threshold,
         NQ, tau, scale_log2);
@@ -313,7 +315,7 @@ static void preprocess_launch(
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
     int64_t vs_b, int64_t vs_t, int64_t vs_h,
-    float tau, float scale_log2, int qk_balance, cudaStream_t stream)
+    float tau, float scale_log2, int qk_balance, int rotate, cudaStream_t stream)
 {
     const Scratch s = carve_scratch(scratch, B, H, NPAD);
     // Off: no balance pass runs and every kernel below takes a null factor,
@@ -341,14 +343,14 @@ static void preprocess_launch(
         prep_balance_factor<<<B * H, HD, 0, stream>>>(s.fk, s.fq, s.fq, s.fk);
     }
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
-        s.kc, s.kmean, fk, (int8_t*)kciP, (float*)kcs, NTB, NPAD);
+        s.kc, s.kmean, fk, (int8_t*)kciP, (float*)kcs, NTB, NPAD, rotate);
     prep_q<E><<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const E*)q, s.kcvar, (int8_t*)qiP, (float*)qs, (float*)threshold,
         (int8_t*)cen8, (float*)cens, (float*)qmean, fq, (const int32_t*)blen,
-        T, H, NQ, NPAD, tau, scale_log2, qs_b, qs_t, qs_h);
+        T, H, NQ, NPAD, tau, scale_log2, qs_b, qs_t, qs_h, rotate);
     prep_k<E><<<dim3(NTB, B * H), HD, 0, stream>>>(
         (const E*)k, s.kmean, (int8_t*)kiP, (float2*)ksb,
-        (const float*)key_bias, fk, (const int32_t*)blen, T, Tp, H, ks_b, ks_t, ks_h);
+        (const float*)key_bias, fk, (const int32_t*)blen, T, Tp, H, ks_b, ks_t, ks_h, rotate);
 }
 
 void launch_sol_preprocess(
@@ -360,12 +362,12 @@ void launch_sol_preprocess(
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
     int64_t vs_b, int64_t vs_t, int64_t vs_h,
-    float tau, float scale_log2, int elem, int qk_balance, cudaStream_t stream)
+    float tau, float scale_log2, int elem, int qk_balance, int rotate, cudaStream_t stream)
 {
     auto fn = elem == sol::SOL_FP16 ? preprocess_launch<__half> : preprocess_launch<__nv_bfloat16>;
     fn(q, k, v, qiP, qs, kiP, ksb, kciP, kcs, vcT, threshold, cen8, cens, vsc, qmean,
        scratch, key_bias, blen, B, T, Tp, H, NTB, NPAD, NQ,
-       qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h, tau, scale_log2, qk_balance, stream);
+       qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h, tau, scale_log2, qk_balance, rotate, stream);
 }
 
 // kc, kmean, kcvar; then the balance's per-block partials (one kc-sized

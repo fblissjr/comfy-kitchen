@@ -57,6 +57,58 @@ constexpr float BAL_ALPHA     = 0.5f;
 constexpr float BAL_MIN_SHARE = 0.2f;
 constexpr int   BAL_TOP       = 4;
 
+// q/k rotation (`rotate`): every q row and every k row is multiplied by the
+// same fixed orthogonal matrix, a random sign diagonal followed by the
+// normalized Sylvester-Hadamard H128, before INT8 quantization. q.k is
+// unchanged; what changes is that a row's energy is spread evenly across
+// its 128 channels, so no loud channel (and no single spike) can set the
+// one scale the row shares. The structural form of what `qk_balance` does
+// per channel; the same transform comfy-kitchen's int8_attention applies.
+// Applied on the LOGICAL channel axis, before perm_d, and mirrored bit for
+// bit in the eager reference (backends/eager/sol_attn.py, hadamard_rotate).
+// The signs are an arbitrary fixed pattern; any fixed pattern works and
+// this one never changes, so every build rotates one way.
+// The four sign words, inline rather than a constexpr array: device code
+// cannot read a namespace-scope array without __constant__ storage.
+constexpr float ROT_NORM = 0.08838834764831845f;   // 1 / sqrt(128)
+__host__ __device__ __forceinline__ float rot_sign(int d) {
+    const int w = d >> 5;
+    const uint32_t word = w == 0 ? 0x1035997bu : w == 1 ? 0x8087f5eeu : w == 2 ? 0xee2e4e1au : 0x71132418u;
+    return ((word >> (d & 31)) & 1u) ? 1.f : -1.f;
+}
+// One thread, one row of 128 floats in local memory: sign, then the seven
+// butterfly stages of the fast Walsh-Hadamard transform, then the norm.
+__device__ __forceinline__ void rot128_serial(float* v) {
+    #pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) v[d] *= rot_sign(d);
+    #pragma unroll
+    for (int bit = 1; bit < HEAD_DIM; bit <<= 1) {
+        #pragma unroll 8
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            if (d & bit) continue;
+            const float a = v[d], b = v[d | bit];
+            v[d] = a + b; v[d | bit] = a - b;
+        }
+    }
+    #pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) v[d] *= ROT_NORM;
+}
+// 128 threads, one channel each, through shared memory `s` (free on return).
+// Same matrix as rot128_serial, so the two agree to fp32 rounding.
+__device__ __forceinline__ float rot128_block(float x, float* s) {
+    const int d = threadIdx.x;
+    float v = x * rot_sign(d);
+    #pragma unroll
+    for (int bit = 1; bit < HEAD_DIM; bit <<= 1) {
+        s[d] = v;
+        __syncthreads();
+        const float o = s[d ^ bit];
+        v = (d & bit) ? o - v : v + o;
+        __syncthreads();
+    }
+    return v * ROT_NORM;
+}
+
 // Contraction-axis permutation: each lane's two MMA operand words become one
 // 8-byte load. Applied to Q/K/pooled-K d axes and V^T's key axis.
 __host__ __device__ __forceinline__ int perm_d(int d) {
@@ -158,11 +210,33 @@ template <typename T>
 __device__ __forceinline__ void quant_q_rows(
     const T* tile, int len, int nrows,
     int8_t* __restrict__ qiP, float* __restrict__ qs, int H,
-    const float* f = nullptr)
+    const float* f = nullptr, bool rotate = false)
 {
     for (int t = threadIdx.x; t < nrows; t += HEAD_DIM) {
         const T* row = tile + t * LD_TILE;   // zero-staged past len
         const bool live = t < len;
+        if (rotate) {
+            // The rotated path builds the row in local memory: the transform
+            // needs every channel before any byte can be written.
+            float v[HEAD_DIM];
+            #pragma unroll 8
+            for (int d = 0; d < HEAD_DIM; ++d) v[d] = to_f32(row[d]) * (f ? f[d] : 1.f);
+            rot128_serial(v);
+            float ar = 0.f;
+            #pragma unroll 8
+            for (int d = 0; d < HEAD_DIM; ++d) ar = fmaxf(ar, fabsf(v[d]));
+            const float scr = live ? fmaxf(ar / 127.0f, 1e-8f) : 0.f;
+            qs[(size_t)t * H] = scr;
+            const float invr = live ? 1.f / scr : 0.f;
+            __align__(16) int8_t outr[HEAD_DIM];
+            #pragma unroll
+            for (int d = 0; d < HEAD_DIM; ++d) outr[perm_d(d)] = q8(v[d], invr);
+            int8_t* dstr = qiP + (size_t)t * H * HEAD_DIM;
+            #pragma unroll
+            for (int c = 0; c < HEAD_DIM; c += 16)
+                *reinterpret_cast<uint4*>(dstr + c) = *reinterpret_cast<const uint4*>(outr + c);
+            continue;
+        }
         float a = 0.f;
         #pragma unroll 8   // unbounded, nvcc hoists all 128 loads: 168 regs in the producer
         for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(to_f32(row[d]) * (f ? f[d] : 1.f)));
@@ -188,13 +262,15 @@ __device__ __forceinline__ void quant_q_rows(
 template <typename T>
 __device__ __forceinline__ float centroid_quant(
     const T* tile, int len, float* sred,
-    int8_t* __restrict__ cen8, float* __restrict__ cens, float fd = 1.f)
+    int8_t* __restrict__ cen8, float* __restrict__ cens, float fd = 1.f,
+    bool rotate = false)
 {
     const int d = threadIdx.x;
     float c = 0.f;
     for (int t = 0; t < len; ++t) c += to_f32(tile[t * LD_TILE + d]);
     c /= (float)len;
-    const float cb = c * fd;
+    float cb = c * fd;
+    if (rotate) cb = rot128_block(cb, sred);
     const float csc = fmaxf(block_max128(fabsf(cb), sred) / 127.0f, 1e-8f);
     char* s8 = reinterpret_cast<char*>(sred);
     s8[perm_d(d)] = (char)q8(cb, 1.f / csc);
@@ -214,12 +290,34 @@ template <typename T>
 __device__ __forceinline__ void quant_k_rows(
     const T* tile, int len, const float* __restrict__ kmean,
     const float* __restrict__ kbias, int8_t* __restrict__ kiP, float2* __restrict__ ksb,
-    const float* f = nullptr)
+    const float* f = nullptr, bool rotate = false)
 {
     for (int p = threadIdx.x; p < BLOCK; p += HEAD_DIM) {
         const int s = perm_key(p);
         const bool live = s < len;
         const T* row = tile + s * LD_TILE;
+        if (rotate) {
+            float v[HEAD_DIM];
+            #pragma unroll 8
+            for (int d = 0; d < HEAD_DIM; ++d)
+                v[d] = (to_f32(row[d]) - kmean[d]) * (f ? f[d] : 1.f);
+            rot128_serial(v);
+            float ar = 0.f;
+            #pragma unroll 8
+            for (int d = 0; d < HEAD_DIM; ++d) ar = fmaxf(ar, fabsf(v[d]));
+            const float scr = fmaxf(ar / 127.0f, 1e-8f);
+            const float biasr = (kbias && live) ? kbias[s] : 0.f;
+            ksb[p] = make_float2(live ? scr : 0.f, live ? biasr : NEG);
+            const float invr = 1.f / scr;
+            __align__(16) int8_t outr[HEAD_DIM];
+            #pragma unroll
+            for (int d = 0; d < HEAD_DIM; ++d) outr[perm_d(d)] = live ? q8(v[d], invr) : (int8_t)0;
+            #pragma unroll
+            for (int c = 0; c < HEAD_DIM; c += 16)
+                *reinterpret_cast<uint4*>(kiP + (size_t)p * HEAD_DIM + c) =
+                    *reinterpret_cast<const uint4*>(outr + c);
+            continue;
+        }
         float a = 0.f;
         for (int d = 0; d < HEAD_DIM; ++d)
             a = fmaxf(a, fabsf((to_f32(row[d]) - kmean[d]) * (f ? f[d] : 1.f)));

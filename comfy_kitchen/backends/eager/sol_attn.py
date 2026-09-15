@@ -15,6 +15,11 @@ from ...registry import registry
 
 BLOCK = 64
 _LOG2E = 1.4426950408889634
+# qk_balance: sage_attention/sol_layout.cuh (BAL_ALPHA, BAL_MIN_SHARE, BAL_TOP)
+# holds the same three values; the fused backend and this reference must agree
+QK_BALANCE_ALPHA = 0.5
+QK_BALANCE_MIN_SHARE = 0.2
+QK_BALANCE_TOP = 4
 # Past this the caller almost certainly wanted a fused backend and got
 # silently downgraded; a clear error beats an allocator failure.
 _MAX_SCORE_BYTES = 4 * 2**30
@@ -117,6 +122,33 @@ def _pool(x: torch.Tensor, n_blocks: int, reduce: str, lengths=None) -> torch.Te
     return blocks.sum(dim=2) / lengths.view(1, -1, 1, 1)
 
 
+def qk_balance_factor(q: torch.Tensor, k: torch.Tensor, lengths=None):
+    """The per-(batch, head, channel) q/k balance the fused backend applies
+    inside its INT8 quantizers, as ``(f for q, 1/f for k)``, fp32
+    ``(B, 1, H, D)`` for ``(B, T, H, D)`` inputs.
+
+    ``f = rms_k^alpha / rms_q^(1-alpha)`` over the live rows, normalized to a
+    geometric mean of one per head, and one on any head whose
+    ``QK_BALANCE_TOP`` loudest K channels carry less than ``QK_BALANCE_MIN_SHARE``
+    of K's energy. ``lengths`` (live rows per 64-block, as ``_block_lengths``
+    returns) masks dead rows out of both rms.
+    """
+    b, t, h, d = q.shape
+    fq, fk = q.float(), k.float()
+    if lengths is not None:
+        live = _valid_rows(t, lengths).view(1, -1, 1, 1)
+        fq, fk = fq * live, fk * live
+    e_k = fk.pow(2).sum(dim=1)                                   # (B, H, D)
+    e_q = fq.pow(2).sum(dim=1)
+    rk = e_k.sqrt().clamp(min=1e-6)
+    rq = e_q.sqrt().clamp(min=1e-6)
+    f = rk.pow(QK_BALANCE_ALPHA) / rq.pow(1.0 - QK_BALANCE_ALPHA)
+    f = f / torch.exp(torch.log(f).mean(dim=-1, keepdim=True))
+    share = torch.topk(e_k, QK_BALANCE_TOP, dim=-1).values.sum(dim=-1) / e_k.sum(dim=-1).clamp(min=1e-30)
+    f = torch.where((share >= QK_BALANCE_MIN_SHARE)[..., None], f, torch.ones_like(f))
+    return f.unsqueeze(1), (1.0 / f).unsqueeze(1)
+
+
 def sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -133,6 +165,7 @@ def sol_attn(
     token_aug: int = 0,   # ignored: the reference is exact arithmetic over the same
                           # block selection, so there is no token routing stage to model
     blk_cnt: torch.Tensor | None = None,
+    qk_balance: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
@@ -147,6 +180,10 @@ def sol_attn(
     many key blocks were exact: the routed set plus the forced sink and
     diagonal pairs, with ``sink_q`` rows at ``ceil(T/64)``. Same contract as the
     fused backends, computed from this reference's own route mask.
+    ``qk_balance`` applies the fused backends' per-channel q/k rescale
+    (``qk_balance_factor``) to the fp32 inputs; every score and the threshold
+    are the same in exact arithmetic, so this is an identity up to fp32
+    rounding here and a different quantization there.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
@@ -186,6 +223,9 @@ def sol_attn(
 
     fq, fk, fv = q.float(), k.float(), v.float()
     lengths = _block_lengths(t, n, q.device, block_len)
+    if qk_balance:
+        bq, bk = qk_balance_factor(fq, fk, lengths if block_len is not None else None)
+        fq, fk = fq * bq, fk * bk
     kc = _pool(fk, n, "mean", lengths)              # (B, N, H, D) summary keys
     vc = _pool(fv, n, "sum", lengths)               # (B, N, H, D) summed values
 
@@ -286,6 +326,7 @@ def _op_sol_attn(
     coarse_gate: torch.Tensor | None,
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
+    qk_balance: bool = False,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
@@ -294,6 +335,7 @@ def _op_sol_attn(
         "tail": tail, "block_len": block_len, "coarse_gate": coarse_gate,
         "token_aug": token_aug,
         "blk_cnt": blk_cnt,
+        "qk_balance": qk_balance,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -302,6 +344,6 @@ def _op_sol_attn(
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
                       key_bias, topk_ratio, tail, block_len, coarse_gate,
-                      token_aug=0, blk_cnt=None):
+                      token_aug=0, blk_cnt=None, qk_balance=False):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

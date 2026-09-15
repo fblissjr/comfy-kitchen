@@ -1468,12 +1468,17 @@ def test_rotate_route_is_invariant():
 
 def test_rotate_token_aug_and_sinks_run():
     """The option composes with token routing and sinks: the pooled tail,
-    the centroid and the group centroids are all rotated consistently."""
+    the centroid AND the token stage's group centroids are rotated
+    consistently, so token routing under rotation is no worse than token
+    routing plain against dense attention. Delete and a group centroid
+    built from the unrotated block means can score rotated keys (found on
+    the block-49 capture 2026-09-15: total error 0.035 -> 0.136)."""
     q, k, v = _loud_qkv(1, 4096 + 5, 4)
-    ref = sol_attn_eager(q, k, v, tau=1.0, sink_blocks=[0, 2])
-    got = ck.sol_attn(q, k, v, tau=1.0, sink_blocks=[0, 2], token_aug=64, rotate=True)
-    assert torch.isfinite(got.float()).all()
-    assert _cos(got, ref) > 0.998
+    ref = _dense(q, k, v)
+    plain = _rel_l2(ck.sol_attn(q, k, v, tau=1.0, sink_blocks=[0, 2], token_aug=64), ref)
+    rot = ck.sol_attn(q, k, v, tau=1.0, sink_blocks=[0, 2], token_aug=64, rotate=True)
+    assert torch.isfinite(rot.float()).all()
+    assert _rel_l2(rot, ref) < 1.1 * plain, (plain, _rel_l2(rot, ref))
 
 
 def test_rotate_signature_parity():
@@ -1489,3 +1494,32 @@ def test_rotate_hip_refuses():
     q, k, v = _qkv(1, 256, 2)
     with pytest.raises(NotImplementedError):
         hip_backend.sol_attn(q, k, v, rotate=True)
+
+
+def test_rotate_chunked_producer_matches_separate_rope():
+    """The producer path rotates chunk by chunk with no sequence statistics:
+    with the flag on it must still track the separate-rope direct path with
+    the same flag (the same reference the plain producer is held to), at
+    both tau extremes. Delete and the producer could silently ignore the
+    flag, or rotate one operand only."""
+    c = _chunked_case(seed=23, rot=96)
+    q, k, v = c["q"], c["k"], c["v"]
+    for tau in (-1e9, 1.0):
+        direct = ck.sol_attn(q, k, v, tau=tau, rotate=True)
+        prod = backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
+                                        tau=tau, rotate=True)[0]
+        assert torch.isfinite(prod.float()).all()
+        assert _cos(prod, direct) > 0.995, (tau, _cos(prod, direct))
+        # and the flag changes the producer's bytes: it is not a no-op there
+        plain = backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], tau=tau)[0]
+        assert not torch.equal(prod, plain), tau
+
+
+def test_rotate_chunked_is_keyword_only_and_hip_refuses():
+    for fn in (cuda_backend.sol_attn_chunked, hip_backend.sol_attn_chunked):
+        param = inspect.signature(fn).parameters["rotate"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is False
+    if backend is hip_backend:
+        c = _chunked_case(seed=17, rot=96)
+        with pytest.raises(NotImplementedError):
+            hip_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], tau=1.0, rotate=True)

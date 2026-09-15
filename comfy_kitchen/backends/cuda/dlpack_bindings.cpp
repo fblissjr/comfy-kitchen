@@ -270,14 +270,14 @@ extern "C" {
         void* workspace, const void* qkv, const void* fab,
         const void* qw, const void* kw, const void* kmean, const void* vscale,
         const void* blen, float rope_eps, int rot_dim, int t0, int M,
-        int batch, int seq_len, int num_heads, int n_tok, cudaStream_t stream);
+        int batch, int seq_len, int num_heads, int n_tok, int rotate, cudaStream_t stream);
     void launch_sol_attn_core(
         void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
         const void* blen, int tail,
         int batch, int seq_len, int num_heads,
         float tau, float scale, const void* ext_threshold,
         int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-        int n_tok, cudaStream_t stream);
+        int n_tok, int rotate, cudaStream_t stream);
     void launch_sol_attn(
         const void* q, const void* k, const void* v, void* out, void* workspace,
         int batch, int seq_len, int num_heads, int head_dim, int elem,
@@ -1622,7 +1622,8 @@ void sol_producer_chunk_py(
     float rope_eps, int64_t rot_dim, int64_t t0, int64_t m,
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0) {
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0,
+    bool rotate = false) {
     if (batch != 1)
         throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
     if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
@@ -1641,7 +1642,7 @@ void sol_producer_chunk_py(
                        kw.data(), kmean.data(), vscale.data(),
                        block_len ? block_len->data() : nullptr,
                        rope_eps, (int)rot_dim, (int)t0, (int)m,
-                       (int)batch, (int)seq_len, (int)num_heads, (int)token_aug,
+                       (int)batch, (int)seq_len, (int)num_heads, (int)token_aug, rotate ? 1 : 0,
                        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
@@ -1655,7 +1656,7 @@ void sol_attn_core_py(
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
-    bool tail = true, int64_t token_aug = 0) {
+    bool tail = true, int64_t token_aug = 0, bool rotate = false) {
     const int64_t stats = batch * num_heads * 128;
     if ((int64_t)vscale.size() != stats || (int64_t)kmean_next.size() != stats ||
         (int64_t)vamax_out.size() != stats)
@@ -1671,7 +1672,7 @@ void sol_attn_core_py(
         (int)batch, (int)seq_len, (int)num_heads,
         tau, scale, threshold ? threshold->data() : nullptr,
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
-        (int)token_aug, reinterpret_cast<cudaStream_t>(stream_ptr));
+        (int)token_aug, rotate ? 1 : 0, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for fused AdaLN (LayerNorm statistics)
@@ -4415,7 +4416,8 @@ NB_MODULE(_C, m) {
           nb::arg("kw"), nb::arg("kmean"), nb::arg("vscale"),
           nb::arg("rope_eps"), nb::arg("rot_dim"), nb::arg("t0"), nb::arg("m"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0);
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0,
+          nb::arg("rotate") = false);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"),
           nb::arg("kmean_next"), nb::arg("vamax_out"),
@@ -4425,7 +4427,7 @@ NB_MODULE(_C, m) {
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
           nb::arg("threshold") = nb::none(),
           nb::arg("block_len") = nb::none(),
-          nb::arg("tail") = true, nb::arg("token_aug") = 0);
+          nb::arg("tail") = true, nb::arg("token_aug") = 0, nb::arg("rotate") = false);
 
     m.def("flash_attention_decode", &flash_attention_decode,
           "Flash Attention decode over a fixed-capacity variable-length KV cache",

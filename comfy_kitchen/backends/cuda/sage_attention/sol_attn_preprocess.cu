@@ -268,15 +268,21 @@ __global__ void prep_sums_to_means(float* __restrict__ kc,
 }
 
 // ---- producer-path threshold from the quantized centroid ----
+// The threshold wants the UNROTATED centroid against the unrotated kcvar
+// (a diagonal approximation, invariant under a rescale but not a mixing).
+// Plain: dequantize cen8 as before, byte for byte. Rotated: cen8 is in the
+// rotated space, so read the f32 block mean the producer left in qmean.
 __global__ void prep_thr_from_cen(const int8_t* __restrict__ cen8,
                                   const float* __restrict__ cens,
                                   const float* __restrict__ kcvar,
+                                  const float* __restrict__ qmean,   // [B*H, NPAD, HD]
                                   float* __restrict__ thr,
-                                  int NQ, float tau, float log2s) {
+                                  int NQ, int NPAD, float tau, float log2s, int rotate) {
     __shared__ float sred[HD];
     const int qb = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
-    const float c = (float)cen8[((size_t)bh * NQ + qb) * HD + perm_d(d)] *
-                    cens[(size_t)bh * NQ + qb];
+    const float c = rotate
+        ? qmean[((size_t)bh * NPAD + qb) * HD + d]
+        : (float)cen8[((size_t)bh * NQ + qb) * HD + perm_d(d)] * cens[(size_t)bh * NQ + qb];
     const float var = block_sum128(c * c * kcvar[(size_t)bh * HD + d], sred);
     if (d == 0) thr[(size_t)bh * NQ + qb] = thr_of(var, tau, log2s);
 }
@@ -287,9 +293,9 @@ __global__ void prep_thr_from_cen(const int8_t* __restrict__ cen8,
 // threshold. The caller places the V scale it quantized with in the vsc slot.
 void launch_sol_finish(
     void* scratch, void* kciP, void* kcs, void* threshold,
-    const void* cen8, const void* cens, void* kmean_next, const void* blen,
+    const void* cen8, const void* cens, const void* qmean, void* kmean_next, const void* blen,
     int B, int T, int H, int NTB, int NPAD, int NQ,
-    float tau, float scale_log2, cudaStream_t stream)
+    float tau, float scale_log2, int rotate, cudaStream_t stream)
 {
     const Scratch s = carve_scratch(scratch, B, H, NPAD);
     prep_sums_to_means<<<B * H, HD, 0, stream>>>(
@@ -297,10 +303,10 @@ void launch_sol_finish(
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(
         s.kc, s.kmean, nullptr, nullptr, s.kcvar, NTB, NPAD);
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
-        s.kc, s.kmean, nullptr, (int8_t*)kciP, (float*)kcs, NTB, NPAD, 0);
+        s.kc, s.kmean, nullptr, (int8_t*)kciP, (float*)kcs, NTB, NPAD, rotate);
     prep_thr_from_cen<<<dim3(NQ, B * H), HD, 0, stream>>>(
-        (const int8_t*)cen8, (const float*)cens, s.kcvar, (float*)threshold,
-        NQ, tau, scale_log2);
+        (const int8_t*)cen8, (const float*)cens, s.kcvar, (const float*)qmean, (float*)threshold,
+        NQ, NPAD, tau, scale_log2, rotate);
 }
 
 template <typename E>

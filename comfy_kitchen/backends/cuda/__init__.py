@@ -2753,10 +2753,17 @@ def sol_attn_chunked(
     token_aug: int = 0,
     *,
     blk_cnt: torch.Tensor | None = None,
+    rotate: bool = False,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
+
+    ``rotate`` (keyword-only): the fixed Hadamard rotation of q/k before INT8,
+    as in ``sol_attn``; needs no sequence statistics, so the producer applies
+    it chunk by chunk. ``qk_balance`` is not offered here: its factor needs
+    the sequence's channel rms, which the producer would have to carry from
+    the previous step the way it carries the key mean.
 
     ``blk_cnt`` (keyword-only): optional int32 ``(1, H, ceil(T/64))`` on the
     device, filled from the same launch with the routed-block count per query
@@ -2817,7 +2824,7 @@ def sol_attn_chunked(
                 _wrap_for_dlpack(km), _wrap_for_dlpack(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
                 block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-                token_aug=int(token_aug))
+                token_aug=int(token_aug), rotate=bool(rotate))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -2846,7 +2853,8 @@ def sol_attn_chunked(
         _wrap_for_dlpack(kmean_next), _wrap_for_dlpack(vamax),
         1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
         threshold=None if threshold is None else _wrap_for_dlpack(threshold),
-        block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug))
+        block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug),
+        rotate=bool(rotate))
     if blk_cnt is not None:
         n = h * p["NQ"]
         blk_cnt.copy_(ws[p["cnt"]:p["cnt"] + 4 * n].view(torch.int32).view(1, h, p["NQ"]))

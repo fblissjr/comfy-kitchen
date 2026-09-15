@@ -52,7 +52,7 @@ __global__ void sol_producer_kernel(
     float* __restrict__ vamax_next,          // [H, HD] atomicMax accumulator
     const int32_t* __restrict__ blen,        // [NTB] valid tokens per block, or null
     float rope_eps, int rot,
-    int t0, int M, int T, int Tp, int H, int NPAD, int NQ)
+    int t0, int M, int T, int Tp, int H, int NPAD, int NQ, int rotate)
 {
     __shared__ __align__(16) __nv_bfloat16 sT[BLK * LD_TILE];
     __shared__ __align__(16) float sred[HD];
@@ -72,10 +72,13 @@ __global__ void sol_producer_kernel(
     __syncthreads();
     norm_rope_rows(sT, LD_TILE, len, fab_t0, qw, rope_eps, rot);
     __syncthreads();
-    quant_q_rows(sT, len, nrows, qiP + ((size_t)tb0 * H + h) * HD, qs + (size_t)tb0 * H + h, H);
+    // `rotate` as in the direct path: the fixed Hadamard needs no sequence
+    // statistics, so the producer applies it chunk by chunk unchanged.
+    quant_q_rows(sT, len, nrows, qiP + ((size_t)tb0 * H + h) * HD, qs + (size_t)tb0 * H + h, H,
+                 nullptr, rotate != 0);
     __syncthreads();
     const size_t qrow = (size_t)h * NQ + nblk;
-    const float c = centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow);
+    const float c = centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow, 1.f, rotate != 0);
     qmean[((size_t)h * NPAD + nblk) * HD + tid] = c;
     __syncthreads();
 
@@ -91,7 +94,8 @@ __global__ void sol_producer_kernel(
         ksumP[((size_t)h * NPAD + nblk) * HD + tid] = sk;
     }
     const size_t dst0 = (size_t)h * Tp + nblk * BLK;
-    quant_k_rows(sT, len, kmean + (size_t)h * HD, nullptr, kiP + dst0 * HD, ksb + dst0);
+    quant_k_rows(sT, len, kmean + (size_t)h * HD, nullptr, kiP + dst0 * HD, ksb + dst0,
+                 nullptr, rotate != 0);
     __syncthreads();
 
     // ---------------- V phase ----------------
@@ -127,7 +131,7 @@ void launch_sol_producer(
     void* qiP, void* qs, void* kiP, void* ksb, void* vTi, void* vRow, void* vcT,
     void* ksumP, void* cen8, void* cens, void* qmean, void* vamax_next,
     const void* blen, float rope_eps, int rot,
-    int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
+    int t0, int M, int T, int Tp, int H, int NPAD, int NQ, int rotate,
     cudaStream_t stream)
 {
     const int nblocks = (M + BLK - 1) / BLK;
@@ -138,5 +142,5 @@ void launch_sol_producer(
         (int8_t*)qiP, (float*)qs, (int8_t*)kiP, (float2*)ksb,
         (int8_t*)vTi, (int8_t*)vRow, (__nv_bfloat16*)vcT, (float*)ksumP,
         (int8_t*)cen8, (float*)cens, (float*)qmean, (float*)vamax_next,
-        (const int32_t*)blen, rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);
+        (const int32_t*)blen, rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ, rotate);
 }

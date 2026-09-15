@@ -72,13 +72,16 @@ __global__ void sol_token_group_kernel(const float* __restrict__ qmean,        /
                                        const uint32_t* __restrict__ bits,      // [B*H, NQ, W] unrouted
                                        int8_t* __restrict__ gcen8, float* __restrict__ gcens,
                                        float* __restrict__ gref, uint32_t* __restrict__ gbits,
-                                       int NQ, int NPAD, int NG, int W) {
+                                       int NQ, int NPAD, int NG, int W, int rotate) {
     __shared__ __align__(16) float sred[HD];
     const int grp = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
     const int qb0 = grp * TOK_GROUP, qb1 = min(NQ, qb0 + TOK_GROUP);
     float c = 0.f;
     for (int qb = qb0; qb < qb1; ++qb) c += qmean[((size_t)bh * NPAD + qb) * HD + d];
     c /= (float)(qb1 - qb0);
+    // qmean is the unrotated f32 block mean; the key rows this centroid is
+    // scored against are rotated when `rotate` is on, so rotate it too.
+    if (rotate) c = rot128_block(c, sred);
     const float csc = fmaxf(block_max128(fabsf(c), sred) / 127.0f, 1e-8f);
     const size_t gs = (size_t)bh * NG + grp;
     gcen8[gs * HD + perm_d(d)] = q8(c, 1.f / csc);
@@ -448,7 +451,7 @@ void launch_sol_token(
     void* tok_hist, void* tok_idx, void* tok_cnt, void* part_o, void* part_m, void* part_l,
     void* o_part, void* m_part, void* l_part,
     int B, int Tp, int H, int NQ, int NPAD, int NTB, int n_tok, int tail,
-    int sink_q_start, int sink_q_end, float scale_log2, cudaStream_t stream)
+    int sink_q_start, int sink_q_end, float scale_log2, int rotate, cudaStream_t stream)
 {
     const size_t s1 = token_smem_bytes(1), s2 = token_smem_bytes(2);
     const int W = (NTB + 31) / 32;
@@ -457,7 +460,7 @@ void launch_sol_token(
     dim3 grid((NG + BQ - 1) / BQ, nsplit, B * H);
     sol_token_group_kernel<<<dim3(NG, B * H), HD, 0, stream>>>(
         (const float*)qmean, (const float*)tok_ref, (const uint32_t*)cand_bits,
-        (int8_t*)gcen8, (float*)gcens, (float*)gref, (uint32_t*)gbits, NQ, NPAD, NG, W);
+        (int8_t*)gcen8, (float*)gcens, (float*)gref, (uint32_t*)gbits, NQ, NPAD, NG, W, rotate);
     // pass 1 has no partial state, so it may split further to keep the 16-bit bins from overflowing
     const int nsplit1 = max(nsplit, (NTB + P1_MAX_TILES * HIST_STRIDE - 1) / (P1_MAX_TILES * HIST_STRIDE));
     dim3 grid1(grid.x, nsplit1, B * H);

@@ -2199,6 +2199,7 @@ def sol_attn_chunked(
     token_aug: int = 0,
     *,
     blk_cnt: torch.Tensor | None = None,
+    rotate: bool = False,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
@@ -2213,6 +2214,9 @@ def sol_attn_chunked(
     if blk_cnt is not None:
         raise NotImplementedError(
             "sol_attn_chunked: blk_cnt is not implemented on the HIP backend yet; pass None")
+    if rotate:
+        raise NotImplementedError(
+            "sol_attn_chunked: rotate is not implemented on the HIP backend yet; pass False")
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned

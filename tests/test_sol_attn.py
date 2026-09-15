@@ -1364,3 +1364,128 @@ def test_qk_balance_hip_refuses():
     q, k, v = _qkv(1, 256, 2)
     with pytest.raises(NotImplementedError):
         hip_backend.sol_attn(q, k, v, qk_balance=True)
+
+
+# ---------------------------------------------------------------------------
+# rotate: a fixed orthogonal rotation of every q/k row before INT8
+# ---------------------------------------------------------------------------
+
+from comfy_kitchen.backends.eager.sol_attn import hadamard_rotate, rotation_matrix  # noqa: E402
+
+
+def _spiked_qkv(b, t, h, seed=0, gain=20.0):
+    """Flat per-channel statistics, but EVERY key row carries one spike in a
+    channel that walks with the token index: no per-channel factor can help
+    (each channel is loud in 1/128 of the rows, so its rms is ordinary and
+    the balance gate stays shut), while every row's shared scale is set by
+    its spike. The outlier shape the rotation exists for."""
+    q, k, v = _qkv(b, t, h, seed=seed)
+    rows = torch.arange(t, device=k.device)
+    chans = (rows * 7) % HD
+    k[0, rows, :, chans] *= gain
+    return q, k, v
+
+
+def test_rotation_matrix_is_orthogonal():
+    """The reference matrix: orthogonal, so q.k is exact under it; and it is
+    the matrix the kernel applies, pinned by the cases below. Delete and a
+    normalization or a sign slip makes 'exact' false everywhere."""
+    r = rotation_matrix()
+    assert torch.allclose(r @ r.T, torch.eye(128), atol=1e-5)
+    q, k, _ = _loud_qkv(1, 256, 2)
+    s0 = q.float()[0, :, 0] @ k.float()[0, :, 0].T
+    s1 = hadamard_rotate(q[0, :, 0]) @ hadamard_rotate(k[0, :, 0]).T
+    assert (s1 - s0).abs().max().item() < 1e-2 * s0.abs().max().item()
+
+
+def test_rotate_eager_is_exact_math():
+    """The reference applies the rotation to fp32 inputs, where it is an
+    identity up to route flips on threshold ties (as for qk_balance)."""
+    q, k, v = _loud_qkv(1, 2048, 4)
+    for kw, bound in (({"tau": 1.0}, 0.05), ({"tau": -1e9}, 2e-3), ({"topk_ratio": 0.2}, 0.05)):
+        plain = sol_attn_eager(q, k, v, **kw)
+        rot = sol_attn_eager(q, k, v, rotate=True, **kw)
+        assert _rel_l2(rot, plain) < bound, (kw, _rel_l2(rot, plain))
+
+
+def test_rotate_loud_channels_improve():
+    """The mechanism on the loud-channel input: with every block routed
+    exactly, the INT8 error against dense attention falls with rotation on.
+    Delete and the rotation could be applied to one operand only (or with
+    different signs) while the matrix test stays green."""
+    q, k, v = _loud_qkv(1, 4096, 4)
+    ref = _dense(q, k, v)
+    plain = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9), ref)
+    rot = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9, rotate=True), ref)
+    assert rot < 0.8 * plain, (plain, rot)
+
+
+def test_rotate_handles_a_token_spike():
+    """What rotation does that the per-channel factor cannot: a spike in one
+    token's row is flattened across that row's channels. Delete and the
+    option can degrade into a second qk_balance while everything else
+    stays green."""
+    q, k, v = _spiked_qkv(1, 4096, 4)
+    assert (_k_share(k) < QK_BALANCE_MIN_SHARE).all(), "the fixture must keep the balance gate shut"
+    ref = _dense(q, k, v)
+    plain = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9), ref)
+    bal = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9, qk_balance=True), ref)
+    rot = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9, rotate=True), ref)
+    assert bal == plain, "a shut gate must leave the plain bytes alone"
+    assert rot < 0.8 * plain, (plain, bal, rot)
+
+
+def test_rotate_composes_with_balance():
+    """Both on is legal and not worse than rotation alone on the loud input."""
+    q, k, v = _loud_qkv(1, 4096, 4)
+    ref = _dense(q, k, v)
+    rot = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9, rotate=True), ref)
+    both = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9, rotate=True, qk_balance=True), ref)
+    assert both < 1.1 * rot, (rot, both)
+
+
+@pytest.mark.parametrize("t", [1024, 3137])
+def test_rotate_matches_eager(t):
+    """Routed, the rotated kernel tracks the reference at least as closely
+    as the plain one on loud-channel inputs; ragged tails included."""
+    q, k, v = _loud_qkv(1, t, 4)
+    ref = sol_attn_eager(q, k, v, tau=1.0)
+    plain = ck.sol_attn(q, k, v, tau=1.0)
+    rot = ck.sol_attn(q, k, v, tau=1.0, rotate=True)
+    assert torch.isfinite(rot.float()).all()
+    assert _cos(rot, ref) > 0.998
+    assert _rel_l2(rot, ref) <= _rel_l2(plain, ref), (_rel_l2(plain, ref), _rel_l2(rot, ref))
+
+
+def test_rotate_route_is_invariant():
+    """The threshold is computed unrotated, so the route moves only on
+    quantized near-ties and the output by no more than that is worth."""
+    q, k, v = _loud_qkv(1, 4096, 4)
+    plain = ck.sol_attn(q, k, v, tau=1.0)
+    rot = ck.sol_attn(q, k, v, tau=1.0, rotate=True)
+    assert _rel_l2(rot, plain) < 0.05, _rel_l2(rot, plain)
+
+
+def test_rotate_token_aug_and_sinks_run():
+    """The option composes with token routing and sinks: the pooled tail,
+    the centroid and the group centroids are all rotated consistently."""
+    q, k, v = _loud_qkv(1, 4096 + 5, 4)
+    ref = sol_attn_eager(q, k, v, tau=1.0, sink_blocks=[0, 2])
+    got = ck.sol_attn(q, k, v, tau=1.0, sink_blocks=[0, 2], token_aug=64, rotate=True)
+    assert torch.isfinite(got.float()).all()
+    assert _cos(got, ref) > 0.998
+
+
+def test_rotate_signature_parity():
+    import inspect
+    for fn in (ck.sol_attn, cuda_backend.sol_attn, hip_backend.sol_attn, sol_attn_eager):
+        param = inspect.signature(fn).parameters["rotate"]
+        assert param.default is False, fn
+
+
+def test_rotate_hip_refuses():
+    if backend is not hip_backend:
+        pytest.skip("HIP backend only")
+    q, k, v = _qkv(1, 256, 2)
+    with pytest.raises(NotImplementedError):
+        hip_backend.sol_attn(q, k, v, rotate=True)

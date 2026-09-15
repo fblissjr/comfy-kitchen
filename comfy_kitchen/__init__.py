@@ -151,6 +151,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
+    qk_balance: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -195,6 +196,19 @@ def sol_attn(
             that produced the output, so it is what the exact stage actually
             walked. None (the default) allocates, copies and synchronizes
             nothing, and the output does not depend on it.
+        qk_balance: Rebalance q and k across channels before INT8
+            quantization: per (batch, head, channel) q is multiplied by a
+            factor and k divided by it, which leaves every q.k score, the
+            routing threshold and the coarse branch unchanged, but evens the
+            channel magnitudes K's single per-row scale has to cover. A head
+            whose four loudest K channels hold under a fifth of its K energy
+            is left exactly as it was, so on ordinary heads the option is
+            inert. The factor comes from the call's own q and k (their
+            per-channel rms over the sequence; ``block_len`` rows past the
+            live length count for nothing) and costs one extra read of q.
+            The eager reference applies the same rescale, which is a no-op
+            for its full-precision arithmetic. Off by default; the CUDA
+            backend only (HIP refuses True).
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -210,6 +224,7 @@ def sol_attn(
         coarse_gate,
         int(token_aug),
         blk_cnt,
+        bool(qk_balance),
     )
 
 

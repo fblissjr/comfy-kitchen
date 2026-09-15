@@ -43,6 +43,19 @@ constexpr float NEG    = -3.0e38f;   // finite, so NEG - NEG == 0 (unlike -inf)
 constexpr int NTOK_MAX = 256;        // token routing: largest token budget
 constexpr int TOK_HIST_BINS = 128;   // token routing: histogram bins per centroid
 constexpr int TOK_GROUP = 2;         // token routing: query blocks per centroid
+// q/k channel balancing (`qk_balance`): q is scaled by f and k by 1/f per
+// (batch, head, channel) before INT8 quantization, which leaves q.k and the
+// routing threshold unchanged and evens the channel magnitudes K's one
+// scale per row has to cover. f = rms_k^ALPHA / rms_q^(1-ALPHA) over the
+// sequence, geometric mean one per head, and one (nothing changes) on a head
+// whose TOP loudest K channels carry less than MIN_SHARE of K's energy: on a
+// flat head moving resolution onto q costs a little for nothing. ALPHA and
+// MIN_SHARE are the values measured on captured MiniMax H3 activations
+// (alpha 1.0 and min_share 0.5 both measured worse); they are not tunable
+// through the API on purpose, so every build quantizes one way.
+constexpr float BAL_ALPHA     = 0.5f;
+constexpr float BAL_MIN_SHARE = 0.2f;
+constexpr int   BAL_TOP       = 4;
 
 // Contraction-axis permutation: each lane's two MMA operand words become one
 // 8-byte load. Applied to Q/K/pooled-K d axes and V^T's key axis.
@@ -138,24 +151,27 @@ __device__ __forceinline__ void stage_tile64(
 // point at (this tile's first token, this head). Rows [len, nrows) exist in
 // memory but are dead (zero-padded tiles) and get zeros; rows past nrows do
 // not exist. The permuted row is built in registers: scattered byte stores
-// cost 128 per token.
+// cost 128 per token. `f` is the per-channel balance factor (128 floats in
+// shared memory) or null for none; a factor of one multiplies exactly, so
+// null and a buffer of ones quantize to the same bytes.
 template <typename T>
 __device__ __forceinline__ void quant_q_rows(
     const T* tile, int len, int nrows,
-    int8_t* __restrict__ qiP, float* __restrict__ qs, int H)
+    int8_t* __restrict__ qiP, float* __restrict__ qs, int H,
+    const float* f = nullptr)
 {
     for (int t = threadIdx.x; t < nrows; t += HEAD_DIM) {
         const T* row = tile + t * LD_TILE;   // zero-staged past len
         const bool live = t < len;
         float a = 0.f;
         #pragma unroll 8   // unbounded, nvcc hoists all 128 loads: 168 regs in the producer
-        for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(to_f32(row[d])));
+        for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(to_f32(row[d]) * (f ? f[d] : 1.f)));
         const float sc = live ? fmaxf(a / 127.0f, 1e-8f) : 0.f;   // dead rows: deterministic zeros
         qs[(size_t)t * H] = sc;
         const float inv = live ? 1.f / sc : 0.f;
         __align__(16) int8_t out[HEAD_DIM];
         #pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(to_f32(row[d]), inv);
+        for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(to_f32(row[d]) * (f ? f[d] : 1.f), inv);
         int8_t* dst = qiP + (size_t)t * H * HEAD_DIM;
         #pragma unroll
         for (int c = 0; c < HEAD_DIM; c += 16)
@@ -164,20 +180,24 @@ __device__ __forceinline__ void quant_q_rows(
 }
 
 // Query-block centroid, quantized like a pseudo-row with the pooled keys'
-// perm_d. One thread per channel; returns this thread's channel mean. `sred`
-// holds bytes on return -- sync before reusing it.
+// perm_d. One thread per channel; returns this thread's channel mean, in the
+// UNBALANCED space (the routing threshold and the coarse branch read it
+// against unbalanced K statistics); `fd` is this channel's balance factor
+// and scales only what is quantized. `sred` holds bytes on return -- sync
+// before reusing it.
 template <typename T>
 __device__ __forceinline__ float centroid_quant(
     const T* tile, int len, float* sred,
-    int8_t* __restrict__ cen8, float* __restrict__ cens)
+    int8_t* __restrict__ cen8, float* __restrict__ cens, float fd = 1.f)
 {
     const int d = threadIdx.x;
     float c = 0.f;
     for (int t = 0; t < len; ++t) c += to_f32(tile[t * LD_TILE + d]);
     c /= (float)len;
-    const float csc = fmaxf(block_max128(fabsf(c), sred) / 127.0f, 1e-8f);
+    const float cb = c * fd;
+    const float csc = fmaxf(block_max128(fabsf(cb), sred) / 127.0f, 1e-8f);
     char* s8 = reinterpret_cast<char*>(sred);
-    s8[perm_d(d)] = (char)q8(c, 1.f / csc);
+    s8[perm_d(d)] = (char)q8(cb, 1.f / csc);
     __syncthreads();
     if (d < HEAD_DIM / 16)
         reinterpret_cast<uint4*>(cen8)[d] = reinterpret_cast<const uint4*>(s8)[d];
@@ -188,11 +208,13 @@ __device__ __forceinline__ float centroid_quant(
 // Centred per-key scale + perm_d'd int8 row; destination row p takes SOURCE
 // row perm_key(p). kbias (log2 units, or null) is indexed by source row and
 // only the exact branch reads it, so biased blocks must be sink-routed. Dead
-// rows get a zero scale, NEG bias and zero bytes.
+// rows get a zero scale, NEG bias and zero bytes. `f` as in quant_q_rows,
+// applied after centring: (k - kmean) / f is k / f centred by kmean / f.
 template <typename T>
 __device__ __forceinline__ void quant_k_rows(
     const T* tile, int len, const float* __restrict__ kmean,
-    const float* __restrict__ kbias, int8_t* __restrict__ kiP, float2* __restrict__ ksb)
+    const float* __restrict__ kbias, int8_t* __restrict__ kiP, float2* __restrict__ ksb,
+    const float* f = nullptr)
 {
     for (int p = threadIdx.x; p < BLOCK; p += HEAD_DIM) {
         const int s = perm_key(p);
@@ -200,7 +222,7 @@ __device__ __forceinline__ void quant_k_rows(
         const T* row = tile + s * LD_TILE;
         float a = 0.f;
         for (int d = 0; d < HEAD_DIM; ++d)
-            a = fmaxf(a, fabsf(to_f32(row[d]) - kmean[d]));
+            a = fmaxf(a, fabsf((to_f32(row[d]) - kmean[d]) * (f ? f[d] : 1.f)));
         const float sc = fmaxf(a / 127.0f, 1e-8f);
         const float bias = (kbias && live) ? kbias[s] : 0.f;
         ksb[p] = make_float2(live ? sc : 0.f, live ? bias : NEG);
@@ -208,7 +230,7 @@ __device__ __forceinline__ void quant_k_rows(
         __align__(16) int8_t out[HEAD_DIM];
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d)
-            out[perm_d(d)] = live ? q8(to_f32(row[d]) - kmean[d], inv) : (int8_t)0;
+            out[perm_d(d)] = live ? q8((to_f32(row[d]) - kmean[d]) * (f ? f[d] : 1.f), inv) : (int8_t)0;
         #pragma unroll
         for (int c = 0; c < HEAD_DIM; c += 16)
             *reinterpret_cast<uint4*>(kiP + (size_t)p * HEAD_DIM + c) =

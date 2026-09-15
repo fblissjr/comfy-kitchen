@@ -1191,3 +1191,176 @@ def test_blk_cnt_chunked_hip_refuses():
     with pytest.raises(NotImplementedError):
         hip_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
                                      tau=1.0, blk_cnt=_counts(1, c["h"], c["t"]))
+
+
+# ---------------------------------------------------------------------------
+# qk_balance: per-head q/k channel rebalancing inside the INT8 quantizers
+# ---------------------------------------------------------------------------
+# What each case would catch if deleted is in its docstring. The synthetic
+# inputs are the right instrument here: these are fidelity properties of the
+# arithmetic (a rescale that is exact for q.k, a gate that is per head), not
+# an accuracy claim about a model.
+
+from comfy_kitchen.backends.eager.sol_attn import (  # noqa: E402
+    QK_BALANCE_MIN_SHARE, QK_BALANCE_TOP, qk_balance_factor)
+
+
+def _loud_qkv(b, t, h, seed=0, loud=(82, 19), gain=12.0, flat_heads=()):
+    """_qkv with a few K channels `gain` times louder on every head except
+    `flat_heads`: the shape the option exists for (one per-row scale across
+    128 channels, a few of them setting it)."""
+    q, k, v = _qkv(b, t, h, seed=seed)
+    for c in loud:
+        k[..., c] *= gain
+    for hh in flat_heads:
+        k[:, :, hh] = _qkv(b, t, 1, seed=seed + 100 + hh)[1][:, :, 0]
+    return q, k, v
+
+
+def _k_share(k):
+    e = k.float().pow(2).sum(dim=1)                                  # (B, H, D)
+    return torch.topk(e, QK_BALANCE_TOP, dim=-1).values.sum(-1) / e.sum(-1)
+
+
+def _rel_l2(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+def test_qk_balance_factor_reference():
+    """The reference factor's algebra: q's and k's factors are reciprocals per
+    channel, the geometric mean per head is one (the rescale changes the
+    balance between channels and nothing else), the gate opens on the loud
+    head and stays shut on the flat one. Delete and a reciprocal, or the
+    normalization, can slip in either the reference or the kernel it pins."""
+    q, k, _ = _loud_qkv(1, 1024, 3, flat_heads=(0,))
+    share = _k_share(k)[0]
+    assert share[0] < QK_BALANCE_MIN_SHARE < share[1], share
+    fq, fk = qk_balance_factor(q, k)
+    assert tuple(fq.shape) == (1, 1, 3, HD) and fq.dtype == torch.float32
+    assert (fq * fk - 1).abs().max().item() < 1e-6
+    assert torch.log(fq).mean(dim=-1).abs().max().item() < 1e-5
+    assert bool((fq[0, 0, 0] == 1).all()), "flat head must keep a factor of one"
+    assert bool((fq[0, 0, 1] != 1).any()) and bool((fq[0, 0, 2] != 1).any())
+
+
+def test_qk_balance_eager_is_exact_math():
+    """The reference applies the rescale to fp32 inputs, where it is an
+    identity: same scores, same route. Delete and the reference could start
+    modelling an effect the kernel does not have (or vice versa).
+
+    The route is a threshold on fp32 sums, and the rescaled sums round
+    differently, so a block whose score sits on the threshold can flip; on
+    the CPU none does, on cuBLAS a few can. Where the counts agree the
+    outputs must agree to bf16 rounding; where they differ, few may, and the
+    output moves by no more than a flipped block is worth. tau=-1e9 has no
+    threshold and is held to the strict bound."""
+    q, k, v = _loud_qkv(1, 2048, 4)
+    for kw in ({"tau": 1.0}, {"tau": -1e9}, {"topk_ratio": 0.2}):
+        cnt_p, cnt_b = _counts(1, 4, 2048), _counts(1, 4, 2048)
+        plain = sol_attn_eager(q, k, v, blk_cnt=cnt_p, **kw)
+        bal = sol_attn_eager(q, k, v, blk_cnt=cnt_b, qk_balance=True, **kw)
+        rel = _rel_l2(bal, plain)
+        if torch.equal(cnt_p, cnt_b):
+            assert rel < 2e-3, (kw, rel)
+        else:
+            assert kw.get("tau") != -1e9, "no threshold, so no route to flip"
+            flipped = (cnt_p != cnt_b).float().mean().item()
+            assert flipped < 0.1 and rel < 0.05, (kw, flipped, rel)
+
+
+def test_qk_balance_closed_gate_is_plain():
+    """On flat heads the gate is shut, the factor is one, and the balanced
+    call must reproduce the plain call's bytes: the balance passes run and
+    change nothing. Delete and "one" can stop meaning "no change"."""
+    q, k, v = _qkv(1, 2048 + 40, 4)
+    assert (_k_share(k) < QK_BALANCE_MIN_SHARE).all()
+    for kw in ({"tau": 1.0}, {"tau": -1e9}, {"topk_ratio": 0.2, "tail": False},
+               {"tau": 1.0, "sink_blocks": [0, 2], "token_aug": 64}):
+        plain = ck.sol_attn(q, k, v, **kw)
+        assert torch.equal(ck.sol_attn(q, k, v, qk_balance=True, **kw), plain), kw
+
+
+def test_qk_balance_gate_is_per_head():
+    """One flat head among loud ones: its output is bit-identical to the plain
+    call's, the loud heads' outputs are not. Delete and the gate can degrade
+    to all-or-nothing, which costs the flat heads for nothing."""
+    q, k, v = _loud_qkv(1, 2048, 4, flat_heads=(2,))
+    plain = ck.sol_attn(q, k, v, tau=1.0)
+    bal = ck.sol_attn(q, k, v, tau=1.0, qk_balance=True)
+    assert torch.equal(bal[:, :, 2], plain[:, :, 2]), "flat head must be untouched"
+    for hh in (0, 1, 3):
+        assert not torch.equal(bal[:, :, hh], plain[:, :, hh]), f"loud head {hh} must be rebalanced"
+
+
+def test_qk_balance_loud_channels_improve():
+    """The mechanism: with every block routed exactly, the INT8 error against
+    dense attention falls on loud-channel inputs. Delete and the option can
+    be inverted (q's factor on k) while every other case stays green."""
+    q, k, v = _loud_qkv(1, 4096, 4)
+    ref = _dense(q, k, v)
+    plain = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9), ref)
+    bal = _rel_l2(ck.sol_attn(q, k, v, tau=-1e9, qk_balance=True), ref)
+    assert bal < 0.8 * plain, (plain, bal)
+
+
+@pytest.mark.parametrize("t", [1024, 3137])
+def test_qk_balance_matches_eager(t):
+    """The contract every option keeps: routed, the balanced kernel tracks
+    the reference at least as closely as the plain one on the inputs the
+    option exists for."""
+    q, k, v = _loud_qkv(1, t, 4)
+    ref = sol_attn_eager(q, k, v, tau=1.0)
+    plain = ck.sol_attn(q, k, v, tau=1.0)
+    bal = ck.sol_attn(q, k, v, tau=1.0, qk_balance=True)
+    assert torch.isfinite(bal.float()).all()
+    assert _cos(bal, ref) > 0.998
+    assert _rel_l2(bal, ref) <= _rel_l2(plain, ref), (_rel_l2(plain, ref), _rel_l2(bal, ref))
+
+
+def test_qk_balance_route_is_invariant():
+    """The threshold is computed in the unbalanced space, so the routed set
+    moves only where a quantized score sits on the threshold. Delete and a
+    balanced threshold (or centroid) could silently reroute everything."""
+    q, k, v = _loud_qkv(1, 4096, 4)
+    cnt_p, cnt_b = _counts(1, 4, 4096), _counts(1, 4, 4096)
+    ck.sol_attn(q, k, v, tau=1.0, blk_cnt=cnt_p)
+    ck.sol_attn(q, k, v, tau=1.0, qk_balance=True, blk_cnt=cnt_b)
+    moved = (cnt_b - cnt_p).abs().float()
+    assert moved.mean().item() < 1.0, moved.mean().item()
+    assert abs(cnt_b.sum().item() - cnt_p.sum().item()) < 0.05 * cnt_p.sum().item()
+
+
+def test_qk_balance_block_len_rows_count_for_nothing():
+    """Dead rows (block_len) are outside both rms: a loud value in a dead row
+    must not move the factor. Delete and a padded tile's garbage could tilt
+    every live row's quantization."""
+    t = 64 * 8
+    q, k, v = _loud_qkv(1, t, 2)
+    blen = torch.full(((t + 63) // 64,), 64, dtype=torch.int32, device="cuda")
+    blen[-1] = 3
+    ref = ck.sol_attn(q, k, v, tau=1.0, block_len=blen, qk_balance=True)
+    k2 = k.clone()
+    k2[:, -60:] = 500.0                      # dead rows of the last block
+    got = ck.sol_attn(q, k2, v, tau=1.0, block_len=blen, qk_balance=True)
+    live = torch.ones(t, dtype=torch.bool, device="cuda")
+    live[-61:] = False                        # live rows of the last block are unspecified output
+    assert torch.equal(got[:, live], ref[:, live])
+
+
+def test_qk_balance_signature_parity():
+    """Every entry takes the option with the same default, so a graph built
+    against one backend calls another without a TypeError."""
+    for fn in (ck.sol_attn, cuda_backend.sol_attn, hip_backend.sol_attn, sol_attn_eager):
+        param = inspect.signature(fn).parameters["qk_balance"]
+        assert param.default is False, fn
+    assert "qk_balance" not in inspect.signature(cuda_backend.sol_attn_chunked).parameters
+
+
+def test_qk_balance_hip_refuses():
+    """The HIP preprocess is a separate source without the balance passes; a
+    silently unbalanced call would be a wrong measurement, so it refuses."""
+    if backend is not hip_backend:
+        pytest.skip("HIP backend only")
+    q, k, v = _qkv(1, 256, 2)
+    with pytest.raises(NotImplementedError):
+        hip_backend.sol_attn(q, k, v, qk_balance=True)

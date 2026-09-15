@@ -2123,6 +2123,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
+    qk_balance: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -2144,6 +2145,12 @@ def sol_attn(
     if blk_cnt is not None:
         raise NotImplementedError(
             "sol_attn: blk_cnt is not implemented on the HIP backend yet; pass None")
+    if qk_balance:
+        # The HIP preprocess is a separate source; the balance passes exist
+        # in the CUDA one only, and a silently unbalanced call would be a
+        # wrong measurement rather than an error.
+        raise NotImplementedError(
+            "sol_attn: qk_balance is not implemented on the HIP backend yet; pass False")
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")

@@ -2632,6 +2632,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     blk_cnt: torch.Tensor | None = None,
+    qk_balance: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
@@ -2647,6 +2648,11 @@ def sol_attn(
     never depends on scheduling; a flat score profile may admit none), and the
     remaining tail is exact for the centroid instead of pooled per block.
     The eager reference ignores it.
+
+    ``qk_balance``: rescale q and k per (batch, head, channel) inside the
+    INT8 quantizers, q by f and k by 1/f, so the loud channels of a head's
+    K stop setting the one scale its 128 channels share. See the public
+    docstring; sage_attention/sol_layout.cuh holds the factor's constants.
     """
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -2701,7 +2707,7 @@ def sol_attn(
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-        tail=bool(tail), token_aug=int(token_aug),
+        tail=bool(tail), token_aug=int(token_aug), qk_balance=bool(qk_balance),
     )
     if blk_cnt is not None:
         # The route stage left one int32 per (b, h, query block) in the plan's

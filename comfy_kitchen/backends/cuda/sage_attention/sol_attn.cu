@@ -39,7 +39,7 @@ void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, 
                            void*, const void*, const void*,
                            int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                           int64_t, int64_t, int64_t, float, float, int, cudaStream_t);
+                           int64_t, int64_t, int64_t, float, float, int, int, cudaStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
 void launch_sol_producer(const void*, const void*, const void*, const void*,
                          const void*, const void*, void*, void*, void*, void*,
@@ -285,7 +285,7 @@ extern "C" void launch_sol_attn(
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
     int64_t vs_b, int64_t vs_t, int64_t vs_h,
-    int n_tok, cudaStream_t stream)
+    int n_tok, int qk_balance, cudaStream_t stream)
 {
     if (head_dim != HD)
         throw std::runtime_error("sol_attn supports head_dim 128, got " + std::to_string(head_dim));
@@ -301,7 +301,7 @@ extern "C" void launch_sol_attn(
                           key_bias, blen,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
-                          tau, scale_log2, elem, stream);
+                          tau, scale_log2, elem, qk_balance, stream);
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, n_tok ? w + p.vRow : nullptr, batch, seq_len, p.Tp, num_heads,
                           vs_b, vs_t, vs_h, elem, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,

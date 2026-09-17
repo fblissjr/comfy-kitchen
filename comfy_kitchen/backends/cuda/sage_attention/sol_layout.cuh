@@ -76,8 +76,11 @@ __host__ __device__ __forceinline__ float rot_sign(int d) {
     const uint32_t word = w == 0 ? 0x1035997bu : w == 1 ? 0x8087f5eeu : w == 2 ? 0xee2e4e1au : 0x71132418u;
     return ((word >> (d & 31)) & 1u) ? 1.f : -1.f;
 }
-// One thread, one row of 128 floats in local memory: sign, then the seven
-// butterfly stages of the fast Walsh-Hadamard transform, then the norm.
+// The matrix, written the plain way: one thread, one row of 128 floats, sign,
+// the seven butterfly stages of the fast Walsh-Hadamard transform, the norm.
+// REFERENCE ONLY since the row quantizers moved to rot128_lane4: this form
+// keeps a whole row in one thread's local memory and measured about a sixth of
+// the Sol call; no kernel calls it.
 __device__ __forceinline__ void rot128_serial(float* v) {
     #pragma unroll
     for (int d = 0; d < HEAD_DIM; ++d) v[d] *= rot_sign(d);
@@ -108,6 +111,40 @@ __device__ __forceinline__ float rot128_block(float x, float* s) {
     }
     return v * ROT_NORM;
 }
+
+// One WARP (32 lanes) per row, four channels per lane, everything in
+// registers: sign, H4 inside the lane, then five lane-shuffle butterflies. It
+// is the form quant_qk_int8.cu's convrot128 uses for the dense kernel and the
+// same matrix as rot128_serial (Sylvester order is a Kronecker product, so the
+// stages commute; the two agree to fp32 rounding). Every lane of the warp must
+// call this the same number of times: the shuffles are synchronising.
+constexpr float ROT_NORM_H32 = 0.1767766952966369f;   // 1 / sqrt(32); H4 carries the 1/2
+__device__ __forceinline__ void rot128_lane4(float* v, int lane) {
+    const int ch = lane << 2;
+    const float x0 = v[0] * rot_sign(ch),     x1 = v[1] * rot_sign(ch + 1);
+    const float x2 = v[2] * rot_sign(ch + 2), x3 = v[3] * rot_sign(ch + 3);
+    const float a0 = x0 + x1, a1 = x0 - x1, a2 = x2 + x3, a3 = x2 - x3;
+    v[0] = (a0 + a2) * 0.5f; v[1] = (a1 + a3) * 0.5f;
+    v[2] = (a0 - a2) * 0.5f; v[3] = (a1 - a3) * 0.5f;
+    #pragma unroll
+    for (int bit = 1; bit < 32; bit <<= 1) {
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[c], bit);
+            v[c] = (lane & bit) ? o - v[c] : v[c] + o;
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) v[c] *= ROT_NORM_H32;
+}
+// max over the 32 lanes of this thread's warp
+__device__ __forceinline__ float warp_max32(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+}
+// 128 threads per 64-token block are four warps, so each warp owns 16 rows.
+constexpr int ROT_ROWS_PER_WARP = BLOCK / (HEAD_DIM / 32);
 
 // Contraction-axis permutation: each lane's two MMA operand words become one
 // 8-byte load. Applied to Q/K/pooled-K d axes and V^T's key axis.
@@ -212,31 +249,42 @@ __device__ __forceinline__ void quant_q_rows(
     int8_t* __restrict__ qiP, float* __restrict__ qs, int H,
     const float* f = nullptr, bool rotate = false)
 {
+    if (rotate) {
+        // One warp per row in place of one thread per row: the transform
+        // needs every channel of a row before any byte can be written, and
+        // the lanes of a warp hold them all between them. perm_d keeps a
+        // lane's four channels as four adjacent bytes, so each lane stores
+        // its own. The staged tile has all 64 rows (zeros past len); only the
+        // OUTPUT rows past nrows do not exist.
+        const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, ch = lane << 2;
+        float fl[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) fl[c] = f ? f[ch + c] : 1.f;
+        for (int j = 0; j < ROT_ROWS_PER_WARP; ++j) {
+            const int t = w * ROT_ROWS_PER_WARP + j;
+            const T* row = tile + t * LD_TILE;
+            float v[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) v[c] = to_f32(row[ch + c]) * fl[c];
+            rot128_lane4(v, lane);
+            const float ar = warp_max32(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
+                                              fmaxf(fabsf(v[2]), fabsf(v[3]))));
+            const bool live = t < len;
+            const float scr = live ? fmaxf(ar / 127.0f, 1e-8f) : 0.f;
+            const float invr = live ? 1.f / scr : 0.f;
+            if (t < nrows) {
+                if (lane == 0) qs[(size_t)t * H] = scr;
+                int8_t* dstr = qiP + (size_t)t * H * HEAD_DIM + perm_d(ch);
+                *reinterpret_cast<uint32_t*>(dstr) =
+                    (uint32_t)(uint8_t)q8(v[0], invr) | ((uint32_t)(uint8_t)q8(v[1], invr) << 8) |
+                    ((uint32_t)(uint8_t)q8(v[2], invr) << 16) | ((uint32_t)(uint8_t)q8(v[3], invr) << 24);
+            }
+        }
+        return;
+    }
     for (int t = threadIdx.x; t < nrows; t += HEAD_DIM) {
         const T* row = tile + t * LD_TILE;   // zero-staged past len
         const bool live = t < len;
-        if (rotate) {
-            // The rotated path builds the row in local memory: the transform
-            // needs every channel before any byte can be written.
-            float v[HEAD_DIM];
-            #pragma unroll 8
-            for (int d = 0; d < HEAD_DIM; ++d) v[d] = to_f32(row[d]) * (f ? f[d] : 1.f);
-            rot128_serial(v);
-            float ar = 0.f;
-            #pragma unroll 8
-            for (int d = 0; d < HEAD_DIM; ++d) ar = fmaxf(ar, fabsf(v[d]));
-            const float scr = live ? fmaxf(ar / 127.0f, 1e-8f) : 0.f;
-            qs[(size_t)t * H] = scr;
-            const float invr = live ? 1.f / scr : 0.f;
-            __align__(16) int8_t outr[HEAD_DIM];
-            #pragma unroll
-            for (int d = 0; d < HEAD_DIM; ++d) outr[perm_d(d)] = q8(v[d], invr);
-            int8_t* dstr = qiP + (size_t)t * H * HEAD_DIM;
-            #pragma unroll
-            for (int c = 0; c < HEAD_DIM; c += 16)
-                *reinterpret_cast<uint4*>(dstr + c) = *reinterpret_cast<const uint4*>(outr + c);
-            continue;
-        }
         float a = 0.f;
         #pragma unroll 8   // unbounded, nvcc hoists all 128 loads: 168 regs in the producer
         for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(to_f32(row[d]) * (f ? f[d] : 1.f)));
@@ -292,32 +340,40 @@ __device__ __forceinline__ void quant_k_rows(
     const float* __restrict__ kbias, int8_t* __restrict__ kiP, float2* __restrict__ ksb,
     const float* f = nullptr, bool rotate = false)
 {
+    if (rotate) {
+        // As in quant_q_rows: one warp per destination row. All 64
+        // destination rows exist; dead ones get a zero scale and zero bytes.
+        const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, ch = lane << 2;
+        float fl[4], km[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) { fl[c] = f ? f[ch + c] : 1.f; km[c] = kmean[ch + c]; }
+        for (int j = 0; j < ROT_ROWS_PER_WARP; ++j) {
+            const int p = w * ROT_ROWS_PER_WARP + j;
+            const int s = perm_key(p);
+            const bool live = s < len;
+            const T* row = tile + s * LD_TILE;
+            float v[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) v[c] = (to_f32(row[ch + c]) - km[c]) * fl[c];
+            rot128_lane4(v, lane);
+            const float ar = warp_max32(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
+                                              fmaxf(fabsf(v[2]), fabsf(v[3]))));
+            const float scr = fmaxf(ar / 127.0f, 1e-8f);
+            const float invr = live ? 1.f / scr : 0.f;
+            if (lane == 0) {
+                const float biasr = (kbias && live) ? kbias[s] : 0.f;
+                ksb[p] = make_float2(live ? scr : 0.f, live ? biasr : NEG);
+            }
+            *reinterpret_cast<uint32_t*>(kiP + (size_t)p * HEAD_DIM + perm_d(ch)) =
+                (uint32_t)(uint8_t)q8(v[0], invr) | ((uint32_t)(uint8_t)q8(v[1], invr) << 8) |
+                ((uint32_t)(uint8_t)q8(v[2], invr) << 16) | ((uint32_t)(uint8_t)q8(v[3], invr) << 24);
+        }
+        return;
+    }
     for (int p = threadIdx.x; p < BLOCK; p += HEAD_DIM) {
         const int s = perm_key(p);
         const bool live = s < len;
         const T* row = tile + s * LD_TILE;
-        if (rotate) {
-            float v[HEAD_DIM];
-            #pragma unroll 8
-            for (int d = 0; d < HEAD_DIM; ++d)
-                v[d] = (to_f32(row[d]) - kmean[d]) * (f ? f[d] : 1.f);
-            rot128_serial(v);
-            float ar = 0.f;
-            #pragma unroll 8
-            for (int d = 0; d < HEAD_DIM; ++d) ar = fmaxf(ar, fabsf(v[d]));
-            const float scr = fmaxf(ar / 127.0f, 1e-8f);
-            const float biasr = (kbias && live) ? kbias[s] : 0.f;
-            ksb[p] = make_float2(live ? scr : 0.f, live ? biasr : NEG);
-            const float invr = 1.f / scr;
-            __align__(16) int8_t outr[HEAD_DIM];
-            #pragma unroll
-            for (int d = 0; d < HEAD_DIM; ++d) outr[perm_d(d)] = live ? q8(v[d], invr) : (int8_t)0;
-            #pragma unroll
-            for (int c = 0; c < HEAD_DIM; c += 16)
-                *reinterpret_cast<uint4*>(kiP + (size_t)p * HEAD_DIM + c) =
-                    *reinterpret_cast<const uint4*>(outr + c);
-            continue;
-        }
         float a = 0.f;
         for (int d = 0; d < HEAD_DIM; ++d)
             a = fmaxf(a, fabsf((to_f32(row[d]) - kmean[d]) * (f ? f[d] : 1.f)));

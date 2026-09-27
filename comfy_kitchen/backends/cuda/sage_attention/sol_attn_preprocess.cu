@@ -380,6 +380,13 @@ void launch_sol_preprocess(
 // array, K's then Q's) and its two per-channel factors. The partials are
 // carved whether or not balancing is on: the Plan is sized before the
 // call's options are known, and a T^2 index array already sits beside it.
+// The q-side balance factor preprocess left in scratch, for the token stage's
+// group centroid: it must see the query transform the keys were quantized
+// against. Valid only after a direct-path preprocess with qk_balance on.
+const float* sol_preprocess_balance_fq(const void* scratch, int B, int H, int NPAD) {
+    return carve_scratch(const_cast<void*>(scratch), B, H, NPAD).fq;
+}
+
 size_t sol_preprocess_scratch_bytes(int B, int H, int NPAD) {
     return ((size_t)2 * B * H * NPAD * HEAD_DIM + (size_t)4 * B * H * HEAD_DIM) * sizeof(float);
 }

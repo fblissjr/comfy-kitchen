@@ -1330,6 +1330,30 @@ def test_qk_balance_route_is_invariant():
     assert abs(cnt_b.sum().item() - cnt_p.sum().item()) < 0.05 * cnt_p.sum().item()
 
 
+def test_qk_balance_token_aug_scores_in_one_space():
+    """qk_balance is exact for q.k, so turning token routing on must not pull
+    the balanced output away from the plain one by more than int8 rounding
+    already does without routing. The token stage's group centroid is built
+    from the raw block means, so it needs the q-side factor the keys were
+    quantized against. Delete that and every open-gate head scores
+    sum_d c_d (k_d - m_d) / f_d instead of c . (k - m): the balance twin of the
+    rotate bug that test_rotate_token_aug_and_sinks_run guards (found reading
+    the token stage, 2026-09-27). The loud channels are set to a 93% top-4 K
+    energy share, block 49's on the H3 capture (docs/h3_block49_quant_error.md);
+    at a 70% share the defect was too small to see."""
+    for seed in (0, 1):
+        q, k, v = _loud_qkv(1, 4096 + 5, 4, seed=seed, gain=30.0)
+        assert (_k_share(k) >= QK_BALANCE_MIN_SHARE).all()   # every head's gate is open
+        base = dict(tau=1.0, sink_blocks=[0, 2])
+        drift_off = _rel_l2(ck.sol_attn(q, k, v, qk_balance=True, **base),
+                            ck.sol_attn(q, k, v, **base))
+        tok = dict(base, token_aug=64)
+        bal = ck.sol_attn(q, k, v, qk_balance=True, **tok)
+        assert torch.isfinite(bal.float()).all()
+        drift_on = _rel_l2(bal, ck.sol_attn(q, k, v, **tok))
+        assert drift_on < 2.0 * drift_off, (seed, drift_off, drift_on)
+
+
 def test_qk_balance_block_len_rows_count_for_nothing():
     """Dead rows (block_len) are outside both rms: a loud value in a dead row
     must not move the factor. Delete and a padded tile's garbage could tilt

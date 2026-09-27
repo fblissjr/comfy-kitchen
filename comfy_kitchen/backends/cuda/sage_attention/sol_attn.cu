@@ -63,8 +63,10 @@ void launch_sol_exact(const void*, const void*, const void*, const void*, const 
 void launch_sol_token(const void*, const void*, const void*, void*, void*, void*, void*,
                       const void*, const void*, const void*, void*, void*,
                       void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                      int, int, int, int, int, int, int, int, int, int, float, int, cudaStream_t);
+                      int, int, int, int, int, int, int, int, int, int, float, int, const void*,
+                      cudaStream_t);
 int sol_token_splits(int, int, int);
+const float* sol_preprocess_balance_fq(const void*, int, int, int);
 
 namespace {
 
@@ -155,7 +157,8 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
                      const void* blen, int tail,
                      int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-                     float scale_log2, int elem, int n_tok, int rotate, cudaStream_t stream)
+                     float scale_log2, int elem, int n_tok, int rotate, const void* fq,
+                     cudaStream_t stream)
 {
     // top-k mode: the caller supplies the per-query-block threshold
     const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
@@ -173,7 +176,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
                          w + p.tokPartO, w + p.tokPartM, w + p.tokPartL,
                          w + p.oPart, w + p.mPart, w + p.lPart,
                          batch, p.Tp, num_heads, p.NQ, p.NPAD, p.NTB, n_tok, tail,
-                         sink_q_start, sink_q_end, scale_log2, rotate, stream);
+                         sink_q_start, sink_q_end, scale_log2, rotate, fq, stream);
     launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
                      w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
                      w + p.vRow, w + p.tokIdx, w + p.tokCnt, n_tok, out,
@@ -272,7 +275,7 @@ extern "C" void launch_sol_attn_core(
                       tau, scale_log2, rotate, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2,
-                    sol::SOL_BF16, n_tok, rotate, stream);
+                    sol::SOL_BF16, n_tok, rotate, nullptr, stream);
     cudaMemcpyAsync(vamax_out, w + p.statsV, stats_bytes, cudaMemcpyDeviceToDevice, stream);
 }
 
@@ -305,5 +308,8 @@ extern "C" void launch_sol_attn(
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, n_tok ? w + p.vRow : nullptr, batch, seq_len, p.Tp, num_heads,
                           vs_b, vs_t, vs_h, elem, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
-                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, elem, n_tok, rotate, stream);
+                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, elem, n_tok, rotate,
+                    qk_balance ? sol_preprocess_balance_fq(w + p.scratch, batch, num_heads, p.NPAD)
+                               : nullptr,
+                    stream);
 }

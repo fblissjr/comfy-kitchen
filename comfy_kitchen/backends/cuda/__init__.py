@@ -50,6 +50,7 @@ __all__ = [
     "rms_rope_",
     "rms_rope1",
     "rms_rope1_",
+    "rms_rope_pack_kv",
     "rms_rope_split_half",
     "rms_rope_split_half_",
     "rms_rope_split_half1",
@@ -3405,6 +3406,45 @@ def rms_rope_(
     )
 
 
+def rms_rope_pack_kv(
+    q: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    k_src: torch.Tensor | None = None,
+    v_src: torch.Tensor | None = None,
+    q_out: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused RMSNorm + RoPE + KV packing for Qwen-Image 2.1."""
+    if k_scale is None:
+        k_scale = q_scale
+    if q_out is None:
+        q_out = q
+
+    stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    _C.rms_rope_pack_kv(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k_out),
+        _wrap_for_dlpack(v_out),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(k_prefix),
+        _wrap_for_dlpack(v_prefix),
+        _wrap_for_dlpack(q_scale),
+        _wrap_for_dlpack(k_scale),
+        _wrap_for_dlpack(k_src) if k_src is not None else None,
+        _wrap_for_dlpack(v_src) if v_src is not None else None,
+        _wrap_for_dlpack(q_out) if q_out is not q else None,
+        float(epsilon),
+        stream_ptr,
+    )
+    return q_out, k_out, v_out
+
+
 def rms_rope_split_half1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -4035,6 +4075,43 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             call_rules=(_validate_cuda_rms_rope,),
+        ),
+        "rms_rope_pack_kv": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4), DivisibleBy(dim=3, factor=128)),
+                ),
+                "k_out": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4), DivisibleBy(dim=3, factor=128)),
+                ),
+                "v_out": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4), DivisibleBy(dim=3, factor=128)),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "k_prefix": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4), DivisibleBy(dim=3, factor=128)),
+                ),
+                "v_prefix": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4), DivisibleBy(dim=3, factor=128)),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1), DivisibleBy(dim=0, factor=128)),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1), DivisibleBy(dim=0, factor=128)),
+                ),
+            },
+            default_devices=cuda_devices,
         ),
         "rms_rope1": FunctionConstraints(
             params={

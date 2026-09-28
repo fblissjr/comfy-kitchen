@@ -126,6 +126,48 @@ def rms_rope(
     )
 
 
+def rms_rope_pack_kv(
+    q: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    k_src: torch.Tensor | None = None,
+    v_src: torch.Tensor | None = None,
+    q_out: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    prefix = k_prefix.shape[1]
+
+    # 1. Prefix K/V copy
+    k_out[:, :prefix].copy_(k_prefix)
+    v_out[:, :prefix].copy_(v_prefix)
+
+    # 2. Q norm + rope
+    q_res = _rms_rope1(q, freqs_cis, q_scale, epsilon, split_half=False)
+    if q_out is not None:
+        q_out.copy_(q_res)
+    else:
+        q.copy_(q_res)
+        q_out = q
+
+    # 3. Target K norm + rope
+    target_k = k_src if k_src is not None else k_out[:, prefix:].clone()
+    k_res = _rms_rope1(target_k, freqs_cis, k_scale, epsilon, split_half=False)
+    k_out[:, prefix:].copy_(k_res)
+
+    # 4. Target V copy (if provided)
+    if v_src is not None:
+        v_out[:, prefix:].copy_(v_src)
+
+    return q_out, k_out, v_out
+
+
 def rms_rope_split_half1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -243,6 +285,48 @@ def _op_rms_rope(
 @_op_rms_rope.register_fake
 def _op_rms_rope_fake(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6):
     return torch.empty_like(q), torch.empty_like(k)
+
+
+@torch.library.custom_op("comfy_kitchen::rms_rope_pack_kv", mutates_args={"k_out", "v_out", "q", "q_out"})
+def _op_rms_rope_pack_kv(
+    q: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    k_src: torch.Tensor | None = None,
+    v_src: torch.Tensor | None = None,
+    q_out: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> None:
+    kwargs = {
+        "q": q,
+        "k_out": k_out,
+        "v_out": v_out,
+        "freqs_cis": freqs_cis,
+        "k_prefix": k_prefix,
+        "v_prefix": v_prefix,
+        "q_scale": q_scale,
+        "k_scale": k_scale,
+        "k_src": k_src,
+        "v_src": v_src,
+        "q_out": q_out,
+        "epsilon": epsilon,
+    }
+    impl = registry.get_implementation("rms_rope_pack_kv", kwargs=kwargs)
+    impl(**kwargs)
+
+
+@_op_rms_rope_pack_kv.register_fake
+def _op_rms_rope_pack_kv_fake(
+    q, k_out, v_out, freqs_cis, k_prefix, v_prefix, q_scale, k_scale=None,
+    k_src=None, v_src=None, q_out=None, epsilon=1e-6
+):
+    return None
+
 
 
 @torch.library.custom_op("comfy_kitchen::rms_rope1", mutates_args=())

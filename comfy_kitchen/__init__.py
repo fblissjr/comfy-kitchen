@@ -113,6 +113,7 @@ __all__ = [
     "rms_rope_",
     "rms_rope1",
     "rms_rope1_",
+    "rms_rope_pack_kv",
     "rms_rope_split_half",
     "rms_rope_split_half_",
     "rms_rope_split_half1",
@@ -796,6 +797,29 @@ def rms_rope_(
     """Apply RMSNorm and interleaved RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.rms_rope_(q, k, freqs_cis, q_scale, k_scale, epsilon)
     return q, k
+
+
+def rms_rope_pack_kv(
+    q: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    k_src: torch.Tensor | None = None,
+    v_src: torch.Tensor | None = None,
+    q_out: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply RMSNorm + RoPE to Q and target K, while packing prefix K/V into k_out/v_out."""
+    torch.ops.comfy_kitchen.rms_rope_pack_kv(
+        q, k_out, v_out, freqs_cis, k_prefix, v_prefix, q_scale, k_scale, k_src, v_src, q_out, epsilon
+    )
+    qo = q if q_out is None else q_out
+    return qo, k_out, v_out
+
 
 
 def rms_rope1(

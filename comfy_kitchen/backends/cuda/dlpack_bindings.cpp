@@ -150,6 +150,38 @@ extern "C" {
         bool split_half,
         cudaStream_t stream);
 
+    void launch_rms_rope_pack_kernel(
+        const void* q,
+        const void* k_src,
+        const void* v_src,
+        void* q_out,
+        void* k_out,
+        void* v_out,
+        const void* k_prefix,
+        const void* v_prefix,
+        const void* freqs,
+        const void* q_scale,
+        const void* k_scale,
+        int64_t batch,
+        int64_t seq,
+        int64_t prefix,
+        int64_t heads,
+        int64_t head_dim,
+        int64_t q_s0, int64_t q_s1, int64_t q_s2,
+        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
+        int64_t ks_s0, int64_t ks_s1, int64_t ks_s2,
+        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2,
+        int64_t vs_s0, int64_t vs_s1, int64_t vs_s2,
+        int64_t vo_s0, int64_t vo_s1, int64_t vo_s2,
+        int64_t kp_s0, int64_t kp_s1, int64_t kp_s2,
+        int64_t vp_s0, int64_t vp_s1, int64_t vp_s2,
+        int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3, int64_t f_s4, int64_t f_s5,
+        int64_t freqs_batch, int64_t freqs_heads,
+        float epsilon,
+        bool copy_v,
+        int dtype_code,
+        cudaStream_t stream);
+
     void launch_dequantize_nvfp4_kernel(
         const void* input,
         const void* global_scale,
@@ -883,6 +915,136 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       freqs.stride(4), freqs.stride(5), q_scale.stride(0), 0,
       epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, false, split_half,
+      reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// Nanobind wrapper: Fused RMSNorm + RoPE + KV packing for Qwen-Image 2.1
+void rms_rope_pack_kv(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k_out,
+    nb::ndarray<nb::device::cuda> v_out,
+    nb::ndarray<nb::device::cuda> freqs,
+    nb::ndarray<nb::device::cuda> k_prefix,
+    nb::ndarray<nb::device::cuda> v_prefix,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_scale,
+    std::optional<nb::ndarray<nb::device::cuda>> k_src,
+    std::optional<nb::ndarray<nb::device::cuda>> v_src,
+    std::optional<nb::ndarray<nb::device::cuda>> q_out,
+    float epsilon,
+    uintptr_t stream_ptr) {
+
+  if (q.ndim() != 4 || k_out.ndim() != 4 || v_out.ndim() != 4 ||
+      k_prefix.ndim() != 4 || v_prefix.ndim() != 4) {
+    throw std::runtime_error(
+        "rms_rope_pack_kv q, k_out, v_out, k_prefix, v_prefix must be 4D tensors [B, S, H, D]");
+  }
+
+  const int64_t batch = q.shape(0);
+  const int64_t seq = q.shape(1);
+  const int64_t heads = q.shape(2);
+  const int64_t head_dim = q.shape(3);
+
+  if (head_dim != 128) {
+    throw std::runtime_error(
+        "rms_rope_pack_kv requires head_dim to be exactly 128");
+  }
+
+  const int64_t prefix = k_prefix.shape(1);
+  if (k_prefix.shape(0) != batch || k_prefix.shape(2) != heads || k_prefix.shape(3) != head_dim ||
+      v_prefix.shape(0) != batch || v_prefix.shape(1) != prefix || v_prefix.shape(2) != heads || v_prefix.shape(3) != head_dim) {
+    throw std::runtime_error(
+        "rms_rope_pack_kv prefix shapes must match [B, prefix, H, D]");
+  }
+
+  if (k_out.shape(0) != batch || k_out.shape(1) != prefix + seq || k_out.shape(2) != heads || k_out.shape(3) != head_dim ||
+      v_out.shape(0) != batch || v_out.shape(1) != prefix + seq || v_out.shape(2) != heads || v_out.shape(3) != head_dim) {
+    throw std::runtime_error(
+        "rms_rope_pack_kv k_out and v_out shapes must be [B, prefix + seq, H, D]");
+  }
+
+  // Validate optional q_out
+  void* q_out_ptr = const_cast<void*>(q.data());
+  int64_t qo_s0 = q.stride(0), qo_s1 = q.stride(1), qo_s2 = q.stride(2);
+  if (q_out.has_value()) {
+    if (q_out->ndim() != 4 || q_out->shape(0) != batch || q_out->shape(1) != seq ||
+        q_out->shape(2) != heads || q_out->shape(3) != head_dim) {
+      throw std::runtime_error("rms_rope_pack_kv q_out shape must match q");
+    }
+    q_out_ptr = q_out->data();
+    qo_s0 = q_out->stride(0);
+    qo_s1 = q_out->stride(1);
+    qo_s2 = q_out->stride(2);
+  }
+
+  // Validate optional k_src
+  const void* k_src_ptr = nullptr;
+  int64_t ks_s0 = 0, ks_s1 = 0, ks_s2 = 0;
+  if (k_src.has_value()) {
+    if (k_src->ndim() != 4 || k_src->shape(0) != batch || k_src->shape(1) != seq ||
+        k_src->shape(2) != heads || k_src->shape(3) != head_dim) {
+      throw std::runtime_error("rms_rope_pack_kv k_src shape must match q");
+    }
+    k_src_ptr = k_src->data();
+    ks_s0 = k_src->stride(0);
+    ks_s1 = k_src->stride(1);
+    ks_s2 = k_src->stride(2);
+  }
+
+  // Validate optional v_src
+  const void* v_src_ptr = nullptr;
+  bool copy_v = false;
+  int64_t vs_s0 = 0, vs_s1 = 0, vs_s2 = 0;
+  if (v_src.has_value()) {
+    if (v_src->ndim() != 4 || v_src->shape(0) != batch || v_src->shape(1) != seq ||
+        v_src->shape(2) != heads || v_src->shape(3) != head_dim) {
+      throw std::runtime_error("rms_rope_pack_kv v_src shape must match q");
+    }
+    v_src_ptr = v_src->data();
+    copy_v = true;
+    vs_s0 = v_src->stride(0);
+    vs_s1 = v_src->stride(1);
+    vs_s2 = v_src->stride(2);
+  }
+
+  // Validate scales
+  if (q_scale.ndim() != 1 || k_scale.ndim() != 1 ||
+      q_scale.shape(0) != head_dim || k_scale.shape(0) != head_dim) {
+    throw std::runtime_error("rms_rope_pack_kv scales must be 1D tensors of length head_dim (128)");
+  }
+
+  // Validate freqs
+  if (freqs.ndim() != 6 ||
+      freqs.shape(3) != head_dim / 2 || freqs.shape(4) != 2 || freqs.shape(5) != 2) {
+    throw std::runtime_error("rms_rope_pack_kv freqs must be 6D tensor with shape [..., 64, 2, 2]");
+  }
+
+  const int dtype_code = map_dtype_to_code(q.dtype());
+  if (dtype_code != 1 && dtype_code != 2) {
+    throw std::runtime_error("rms_rope_pack_kv supports FP16 (1) and BF16 (2) only");
+  }
+  if (map_dtype_to_code(k_out.dtype()) != dtype_code ||
+      map_dtype_to_code(v_out.dtype()) != dtype_code ||
+      map_dtype_to_code(k_prefix.dtype()) != dtype_code ||
+      map_dtype_to_code(v_prefix.dtype()) != dtype_code) {
+    throw std::runtime_error("rms_rope_pack_kv all input/output tensors must share dtype");
+  }
+
+  launch_rms_rope_pack_kernel(
+      q.data(), k_src_ptr, v_src_ptr, q_out_ptr, k_out.data(), v_out.data(),
+      k_prefix.data(), v_prefix.data(), freqs.data(), q_scale.data(), k_scale.data(),
+      batch, seq, prefix, heads, head_dim,
+      q.stride(0), q.stride(1), q.stride(2),
+      qo_s0, qo_s1, qo_s2,
+      ks_s0, ks_s1, ks_s2,
+      k_out.stride(0), k_out.stride(1), k_out.stride(2),
+      vs_s0, vs_s1, vs_s2,
+      v_out.stride(0), v_out.stride(1), v_out.stride(2),
+      k_prefix.stride(0), k_prefix.stride(1), k_prefix.stride(2),
+      v_prefix.stride(0), v_prefix.stride(1), v_prefix.stride(2),
+      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3), freqs.stride(4), freqs.stride(5),
+      freqs.shape(0), freqs.shape(2),
+      epsilon, copy_v, dtype_code,
       reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
@@ -4273,6 +4435,22 @@ NB_MODULE(_C, m) {
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
           nb::arg("split_half") = false);
+
+    m.def("rms_rope_pack_kv", &rms_rope_pack_kv,
+          "Fused RMSNorm + RoPE + KV packing for Qwen-Image 2.1",
+          nb::arg("q"),
+          nb::arg("k_out"),
+          nb::arg("v_out"),
+          nb::arg("freqs"),
+          nb::arg("k_prefix"),
+          nb::arg("v_prefix"),
+          nb::arg("q_scale"),
+          nb::arg("k_scale"),
+          nb::arg("k_src") = nb::none(),
+          nb::arg("v_src") = nb::none(),
+          nb::arg("q_out") = nb::none(),
+          nb::arg("epsilon") = 1e-6f,
+          nb::arg("stream_ptr") = 0);
 
     m.def("quantize_nvfp4", &quantize_nvfp4,
           "Quantize to FP4 E2M1 with E4M3 block scales using cuBLAS tiled layout",

@@ -19,6 +19,7 @@ __all__ = [
     "rms_rope_",
     "rms_rope1",
     "rms_rope1_",
+    "rms_rope_pack_kv",
     "rms_rope_split_half",
     "rms_rope_split_half_",
     "rms_rope_split_half1",
@@ -114,6 +115,7 @@ from .rope import (
     rms_rope,
     rms_rope1,
     rms_rope1_,
+    rms_rope_pack_kv,
     rms_rope_,
     rms_rope_split_half,
     rms_rope_split_half1,
@@ -269,6 +271,35 @@ def _build_constraints() -> dict:
                 ),
                 "freqs_cis": ParamConstraint(
                     dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope_pack_kv": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "k_out": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "v_out": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "k_prefix": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "v_prefix": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
                 ),
                 "q_scale": ParamConstraint(
                     dtypes=standard_floats, shape_rules=(ExactDims(1),),

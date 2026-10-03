@@ -478,6 +478,9 @@ __device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint
 // chunks. One warp owns 16 rows: g = lane >> 2 picks rows g and g + 8, qd = lane & 3
 // the column pair, so every per-row array below is [2].
 
+#ifndef SOL_PROBE
+#define SOL_PROBE 0
+#endif
 constexpr int TILE_KC  = HEAD_DIM / 32;   // int8 k-chunks of S = Q.K^T
 constexpr int TILE_NKT = BLOCK / 8;       // score n8 tiles
 constexpr int TILE_NT  = HEAD_DIM / 8;    // output n8 tiles
@@ -499,7 +502,9 @@ __device__ __forceinline__ void tile_qk(const int8_t* sK_tile, const uint32_t (&
         for (int kc = 0; kc < TILE_KC; ++kc) {
             const uint2 kb = *reinterpret_cast<const uint2*>(krow + (((kc * 2 + qhi) ^ swk) << 4));
             uint32_t kbf[2] = {kb.x, kb.y};
+#if SOL_PROBE != 2 && SOL_PROBE != 8
             mma_s8(s_acc[nt], qa[kc], kbf);
+#endif
         }
     }
 }
@@ -514,7 +519,11 @@ __device__ __forceinline__ void tile_scores(const int32_t (&s_acc)[TILE_NKT][4],
     #pragma unroll
     for (int nt = 0; nt < TILE_NKT; ++nt) {
         const int c0 = nt * 8 + qd * 2;
+#if SOL_PROBE == 7
+        const float4 kb4 = make_float4(1.0e-3f, 0.f, 1.0e-3f, 0.f);
+#else
         const float4 kb4 = *reinterpret_cast<const float4*>(kb_src + c0);
+#endif
         const float k0s = kb4.x, m0 = kb4.y, k1s = kb4.z, m1 = kb4.w;
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
@@ -575,7 +584,11 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
     for (int nt = 0; nt < TILE_NKT; ++nt) {
         #pragma unroll
         for (int e = 0; e < 4; ++e)
+#if SOL_PROBE == 3
+            p_val[nt][e] = 1.0f;
+#else
             p_val[nt][e] = exp2f(p_val[nt][e] - m_off[e >> 1]);
+#endif
     }
 
     // free repack (see the header comment): n-tiles (4kk, 4kk+1) -> keys 32kk+4q..+3
@@ -604,9 +617,11 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
     l_r[0] = l_r[0] * alpha0 + (float)li[0];
     l_r[1] = l_r[1] * alpha1 + (float)li[1];
 
-    #pragma unroll
-    for (int nt = 0; nt < TILE_NT; ++nt) {
-        int32_t d[4] = {0, 0, 0, 0};
+    // Pipelined: n-tile nt+1's dot products are issued before n-tile nt's are
+    // converted and accumulated, so the conversion and FMA overlap the next
+    // Tensor Core issue instead of waiting on it. Same arithmetic per output.
+    auto pv_dot = [&](int nt, int32_t* d) {
+        d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0;
         const int C = nt * 8 + g;
         const int8_t* vcol = sVt_tile + C * TILE_LDV + ((qd & 1) << 3);
         const int swv = swz_v(C), qhi2 = qd >> 1;
@@ -614,13 +629,25 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
         for (int kk = 0; kk < TILE_PKC; ++kk) {
             const uint2 vb = *reinterpret_cast<const uint2*>(vcol + (((kk * 2 + qhi2) ^ swv) << 4));
             uint32_t vbf[2] = {vb.x, vb.y};
+#if SOL_PROBE != 1 && SOL_PROBE != 8
             mma_u8s8(d, pa[kk], vbf);
+#endif
         }
+    };
+    auto pv_acc = [&](int nt, const int32_t* d) {
         o_acc[nt][0] = fmaf(o_acc[nt][0], alpha0, (float)d[0]);
         o_acc[nt][1] = fmaf(o_acc[nt][1], alpha0, (float)d[1]);
         o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, (float)d[2]);
         o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, (float)d[3]);
+    };
+    int32_t dd[2][4];
+    pv_dot(0, dd[0]);
+    #pragma unroll
+    for (int nt = 1; nt < TILE_NT; ++nt) {
+        pv_dot(nt, dd[nt & 1]);
+        pv_acc(nt - 1, dd[(nt - 1) & 1]);
     }
+    pv_acc(TILE_NT - 1, dd[(TILE_NT - 1) & 1]);
 }
 
 __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {

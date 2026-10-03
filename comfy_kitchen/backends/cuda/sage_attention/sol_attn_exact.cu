@@ -31,6 +31,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "sol_probe.h"   // probe builds only: defines SOL_PROBE for this TU
 #include "sol_layout.cuh"
 
 namespace {
@@ -47,7 +48,7 @@ constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 // kiP: [B*H,Tp,D] int8 (perm_key + perm_d)   ksb: [B*H,Tp] float2 = (ks, bias)
 // vTi: [B*H,D,Tp] int8 (transposed; perm_d on keys, no perm_key)   vsc: [B*H,D] f32
 // sm_120 fits 3 blocks/SM without spilling; sm_89 would spill, so Ada is unbounded.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200) || SOL_PROBE == 10 || SOL_PROBE == 11
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS, 3)
 #else
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS)
@@ -69,6 +70,9 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
 #if SOL_SM80
     __shared__ __align__(16) int8_t sK[NSTAGE * BK * LDK];
     __shared__ __align__(16) int8_t sVt[NSTAGE * HD * LDV];
+#if SOL_PROBE == 10
+    __shared__ __align__(16) float2 sKbR[NSTAGE * BK];   // the tile's (ks, bias), staged with it
+#endif
 #define SK(b)   (sK   + (size_t)(b) * BK * LDK)
 #define SVT(b)  (sVt  + (size_t)(b) * HD * LDV)
 
@@ -125,20 +129,33 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         l_r[0] = l_r[1] = l_part[qb_s];
     }
 
+#if SOL_PROBE == 10
+#define SOLX_STAGE_KB(buf, k0)                                             \
+        if (tid < BK / 2)                                                  \
+            cp_async16(sKbR + (size_t)(buf) * BK + tid * 2, ksb + kp_base + (k0) + tid * 2);
+#else
+#define SOLX_STAGE_KB(buf, k0)
+#endif
+#if SOL_PROBE == 4
+#define SOL_STAGE_ON 0
+#else
+#define SOL_STAGE_ON 1
+#endif
 #define SOLX_STAGE(kbi, buf)                                               \
     {                                                                      \
         const int64_t k0_ = (int64_t)(kbi) * BK;   /* kbi is a block id */ \
         constexpr int VEC = HD / 16;                                       \
-        for (int idx = tid; idx < BK * VEC; idx += NTHREADS) {             \
+        for (int idx = tid; SOL_STAGE_ON && idx < BK * VEC; idx += NTHREADS) {  \
             const int p = idx / VEC, c16 = idx % VEC;                      \
             cp_async16(SK(buf) + p * LDK + ((c16 ^ swz_k(p)) << 4),        \
                        kiP + kd_base + (k0_ + p) * HD + c16 * 16);         \
         }                                                                  \
-        for (int idx = tid; idx < HD * 4; idx += NTHREADS) {               \
+        for (int idx = tid; SOL_STAGE_ON && idx < HD * 4; idx += NTHREADS) {  \
             const int c = idx >> 2, part = idx & 3;                        \
             cp_async16(SVT(buf) + c * LDV + ((part ^ swz_v(c)) << 4),      \
                        vTi + vT_base + (int64_t)c * Tp + k0_ + part * 16); \
         }                                                                  \
+        SOLX_STAGE_KB(buf, k0_)                                            \
     }
 
     #pragma unroll
@@ -168,10 +185,20 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         }
         cp_commit();
         cp_wait<NSTAGE - 1>();
+#if SOL_PROBE != 5
         __syncthreads();
+#endif
 
+#if SOL_PROBE != 9
+#if SOL_PROBE == 10
+        compute_tile(cur, sKbR + (size_t)cur * BK);
+#else
         compute_tile(cur, ksb + kp_base + cur_k0);
+#endif
+#endif
+#if SOL_PROBE != 5 && SOL_PROBE != 6
         __syncthreads();   // next iteration refills `cur`
+#endif
     }
 #undef SOLX_STAGE
 

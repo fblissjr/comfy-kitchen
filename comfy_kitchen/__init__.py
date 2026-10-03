@@ -159,6 +159,7 @@ def sol_attn(
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
     rotate: bool = False,
+    tau_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -227,6 +228,16 @@ def sol_attn(
             comfy-kitchen's ``int8_attention`` applies. Off by default; the
             CUDA backend only (HIP refuses True).
 
+        tau_map: Optional float32 ``(H, ceil(T/64))`` tensor on the device:
+            a tau for each head and query block, used in ``tau``'s place
+            (``tau`` is then ignored). The routing threshold is one product
+            per head and query block either way, so a map filled with one
+            value is the scalar call bit for bit, and each head's output
+            under a map equals its output in a scalar call at that head's
+            value. A large negative entry routes every block for that query
+            block and head. Not with ``topk_ratio``. CUDA and eager only
+            (HIP refuses it); the chunked producer does not take it.
+
     Returns:
         ``(B, T, H, 128)`` attention output.
     """
@@ -243,6 +254,7 @@ def sol_attn(
         blk_cnt,
         bool(qk_balance),
         bool(rotate),
+        tau_map,
     )
 
 

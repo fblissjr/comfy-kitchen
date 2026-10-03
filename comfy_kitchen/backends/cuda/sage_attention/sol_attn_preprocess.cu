@@ -199,6 +199,7 @@ __global__ void prep_q(const E* __restrict__ q, const float* __restrict__ kcvar,
                        float* __restrict__ qmean,   // [B*H, NPAD, HD] f32 block means
                        const float* __restrict__ fq,   // [B*H, HD] balance, or null
                        const int32_t* __restrict__ blen,
+                       const float* __restrict__ tau_map,   // [H, NQ] f32 in tau's place, or null
                        int T, int H, int NQ, int NPAD, float tau, float log2s,
                        int64_t sb, int64_t st, int64_t sh, int rotate) {
     __shared__ __align__(16) E sQ[BLK * LD_TILE];
@@ -221,7 +222,10 @@ __global__ void prep_q(const E* __restrict__ q, const float* __restrict__ kcvar,
     qmean[((size_t)bh * NPAD + qb) * HD + threadIdx.x] = c;
     __syncthreads();                       // sred held the centroid bytes
     const float var = block_sum128(c * c * kcvar[(size_t)bh * HD + threadIdx.x], sred);
-    if (threadIdx.x == 0) thr[qrow] = thr_of(var, tau, log2s);
+    // tau_map gives each (head, query block) its own tau; the same product, so a
+    // map filled with tau is the scalar call bit for bit.
+    if (threadIdx.x == 0)
+        thr[qrow] = thr_of(var, tau_map ? tau_map[(size_t)head * NQ + qb] : tau, log2s);
 }
 
 // ---- pass 5: centre + quantize K into the permuted layout ----
@@ -317,6 +321,7 @@ static void preprocess_launch(
     void* scratch,           // sol_preprocess_scratch_bytes
     const void* key_bias,    // [B, T] f32 in log2 units, or nullptr
     const void* blen,        // [NTB] int32 valid tokens per block, or nullptr
+    const void* tau_map,     // [H, NQ] f32 per-(head, query block) tau, or nullptr
     int B, int T, int Tp, int H, int NTB, int NPAD, int NQ,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -353,6 +358,7 @@ static void preprocess_launch(
     prep_q<E><<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const E*)q, s.kcvar, (int8_t*)qiP, (float*)qs, (float*)threshold,
         (int8_t*)cen8, (float*)cens, (float*)qmean, fq, (const int32_t*)blen,
+        (const float*)tau_map,
         T, H, NQ, NPAD, tau, scale_log2, qs_b, qs_t, qs_h, rotate);
     prep_k<E><<<dim3(NTB, B * H), HD, 0, stream>>>(
         (const E*)k, s.kmean, (int8_t*)kiP, (float2*)ksb,
@@ -363,7 +369,7 @@ void launch_sol_preprocess(
     const void* q, const void* k, const void* v,
     void* qiP, void* qs, void* kiP, void* ksb, void* kciP, void* kcs,
     void* vcT, void* threshold, void* cen8, void* cens, void* vsc, void* qmean,
-    void* scratch, const void* key_bias, const void* blen,
+    void* scratch, const void* key_bias, const void* blen, const void* tau_map,
     int B, int T, int Tp, int H, int NTB, int NPAD, int NQ,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -372,7 +378,7 @@ void launch_sol_preprocess(
 {
     auto fn = elem == sol::SOL_FP16 ? preprocess_launch<__half> : preprocess_launch<__nv_bfloat16>;
     fn(q, k, v, qiP, qs, kiP, ksb, kciP, kcs, vcT, threshold, cen8, cens, vsc, qmean,
-       scratch, key_bias, blen, B, T, Tp, H, NTB, NPAD, NQ,
+       scratch, key_bias, blen, tau_map, B, T, Tp, H, NTB, NPAD, NQ,
        qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h, tau, scale_log2, qk_balance, rotate, stream);
 }
 

@@ -2722,10 +2722,11 @@ def sol_attn(
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
     rotate: bool = False,
+    tau_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
-    ``block_len``, ``coarse_gate`` and ``blk_cnt``.
+    ``block_len``, ``coarse_gate``, ``blk_cnt`` and ``tau_map``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
@@ -2781,6 +2782,16 @@ def sol_attn(
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
     thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
            if topk_ratio else None)
+    tm = None
+    if tau_map is not None:
+        nq = (t + 63) // 64
+        if topk_ratio:
+            raise ValueError("sol_attn: tau_map and topk_ratio are two selections; pass one")
+        if tuple(tau_map.shape) != (h, nq) or tau_map.dtype != torch.float32 or tau_map.device != q.device:
+            raise ValueError(
+                f"sol_attn: tau_map must be a float32 (H, ceil(T/64)) = ({h}, {nq}) tensor on "
+                f"{q.device}, got {tuple(tau_map.shape)} {tau_map.dtype} on {tau_map.device}")
+        tm = tau_map.contiguous()
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
@@ -2804,6 +2815,7 @@ def sol_attn(
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
         tail=bool(tail), token_aug=int(token_aug), qk_balance=bool(qk_balance),
         rotate=bool(rotate),
+        tau_map=None if tm is None else _wrap_for_dlpack(tm),
     )
     if blk_cnt is not None:
         # The route stage left one int32 per (b, h, query block) in the plan's

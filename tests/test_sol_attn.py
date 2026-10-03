@@ -1547,3 +1547,72 @@ def test_rotate_chunked_is_keyword_only_and_hip_refuses():
         c = _chunked_case(seed=17, rot=96)
         with pytest.raises(NotImplementedError):
             hip_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], tau=1.0, rotate=True)
+
+
+# ---- tau_map: a tau per head and query block ----
+
+def _nq(t):
+    return (t + 63) // 64
+
+
+@pytest.mark.parametrize("t", [1024, 2048 + 32])
+def test_tau_map_filled_is_the_scalar_call(t):
+    """One product per head and query block either way, so a map holding one
+    value must be the scalar call bit for bit, counts included."""
+    if backend is hip_backend:
+        pytest.skip("tau_map is CUDA and eager only")
+    q, k, v = _qkv(1, t, 4)
+    c0 = torch.zeros((1, 4, _nq(t)), dtype=torch.int32, device=q.device)
+    c1 = torch.zeros_like(c0)
+    want = ck.sol_attn(q, k, v, tau=1.3, blk_cnt=c0)
+    full = torch.full((4, _nq(t)), 1.3, device=q.device)
+    got = ck.sol_attn(q, k, v, tau=9.0, tau_map=full, blk_cnt=c1)
+    assert torch.equal(got, want) and torch.equal(c0, c1)
+
+
+def test_tau_map_per_head_equals_each_head_alone():
+    """A head's routing reads no other head's, so its output under a per-head
+    map is its output in a scalar call at that head's value."""
+    if backend is hip_backend:
+        pytest.skip("tau_map is CUDA and eager only")
+    t, h = 2048, 4
+    q, k, v = _qkv(1, t, h)
+    taus = [0.5, 1.0, 2.0, 4.0]
+    m = torch.tensor(taus, device=q.device).view(h, 1).expand(h, _nq(t)).contiguous()
+    cm = torch.zeros((1, h, _nq(t)), dtype=torch.int32, device=q.device)
+    got = ck.sol_attn(q, k, v, tau_map=m, blk_cnt=cm)
+    for i, tau in enumerate(taus):
+        ci = torch.zeros_like(cm)
+        alone = ck.sol_attn(q, k, v, tau=tau, blk_cnt=ci)
+        assert torch.equal(got[:, :, i], alone[:, :, i])
+        assert torch.equal(cm[:, i], ci[:, i])
+    # and the eager reference agrees on the per-head routing
+    assert _cos(got, sol_attn_eager(q, k, v, tau_map=m)) > 0.998
+
+
+def test_tau_map_very_negative_is_a_dense_query_block():
+    """A large negative tau routes every key block, which is what sink_q does
+    for its range: the map can make any set of (head, query block) dense."""
+    if backend is hip_backend:
+        pytest.skip("tau_map is CUDA and eager only")
+    t, h = 2048, 4
+    q, k, v = _qkv(1, t, h)
+    nq = _nq(t)
+    m = torch.full((h, nq), 1.0, device=q.device)
+    m[:, :3] = -1.0e30
+    cm = torch.zeros((1, h, nq), dtype=torch.int32, device=q.device)
+    cs = torch.zeros_like(cm)
+    got = ck.sol_attn(q, k, v, tau_map=m, blk_cnt=cm)
+    want = ck.sol_attn(q, k, v, tau=1.0, sink_q=[0, 3], blk_cnt=cs)
+    assert bool((cm[0, :, :3] == nq).all())
+    assert torch.equal(got, want)
+
+
+def test_tau_map_is_checked():
+    if backend is hip_backend:
+        pytest.skip("tau_map is CUDA and eager only")
+    q, k, v = _qkv(1, 1024, 4)
+    with pytest.raises(ValueError):
+        ck.sol_attn(q, k, v, tau_map=torch.ones((4, 3), device=q.device))
+    with pytest.raises(ValueError):
+        ck.sol_attn(q, k, v, tau_map=torch.ones((4, _nq(1024)), device=q.device), topk_ratio=0.2)

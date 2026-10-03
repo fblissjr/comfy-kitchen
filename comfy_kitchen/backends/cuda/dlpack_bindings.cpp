@@ -292,7 +292,7 @@ extern "C" {
         int64_t qs_b, int64_t qs_t, int64_t qs_h,
         int64_t ks_b, int64_t ks_t, int64_t ks_h,
         int64_t vs_b, int64_t vs_t, int64_t vs_h,
-        int n_tok, int qk_balance, int rotate, cudaStream_t stream);
+        int n_tok, int qk_balance, int rotate, const void* tau_map, cudaStream_t stream);
 
     // fp16-accumulate NDHWC conv3d with fused bias/residual — see ops/cutlass_conv3d_fp16.cu.
     // resid is a full NZPQK tensor (resid_full) or a K-vector broadcast to every row.
@@ -1594,11 +1594,19 @@ void sol_attn(
     std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
-    bool tail = true, int64_t token_aug = 0, bool qk_balance = false, bool rotate = false)
+    bool tail = true, int64_t token_aug = 0, bool qk_balance = false, bool rotate = false,
+    std::optional<nb::ndarray<nb::device::cuda>> tau_map = std::nullopt)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
+    if (tau_map) {
+        if ((int64_t)tau_map->size() != num_heads * ((seq_len + 63) / 64))
+            throw std::runtime_error("sol_attn: tau_map must have H*ceil(T/64) elements");
+        if (tau_map->dtype() != nb::dtype<float>())
+            throw std::runtime_error("sol_attn: tau_map must be float32");
+        need_contiguous(*tau_map, "sol_attn", "tau_map");
+    }
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
     const int elem = sol_elem_code(q);
     if (elem < 0) throw std::runtime_error("sol_attn: q must be bfloat16 or float16");
@@ -1623,7 +1631,8 @@ void sol_attn(
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2), (int)token_aug, qk_balance ? 1 : 0, rotate ? 1 : 0, stream);
+        v.stride(0), v.stride(1), v.stride(2), (int)token_aug, qk_balance ? 1 : 0, rotate ? 1 : 0,
+        tau_map ? tau_map->data() : nullptr, stream);
 }
 
 void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
@@ -4518,7 +4527,8 @@ NB_MODULE(_C, m) {
           nb::arg("threshold") = nb::none(),
           nb::arg("block_len") = nb::none(),
           nb::arg("tail") = true, nb::arg("token_aug") = 0,
-          nb::arg("qk_balance") = false, nb::arg("rotate") = false);
+          nb::arg("qk_balance") = false, nb::arg("rotate") = false,
+          nb::arg("tau_map") = nb::none());
 
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"),

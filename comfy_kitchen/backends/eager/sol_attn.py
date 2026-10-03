@@ -189,8 +189,12 @@ def sol_attn(
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
     rotate: bool = False,
+    tau_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
+
+    ``tau_map`` (float32 ``(H, ceil(T/64))``) gives each head and query block
+    its own tau in ``tau``'s place; not with ``topk_ratio``.
 
     ``topk_ratio`` > 0 selects SLA-style per-query-block top-k instead of the
     tau threshold (sinks and diagonal still forced exact); tau is ignored.
@@ -314,7 +318,11 @@ def sol_attn(
     else:
         # tau sigma of the proxy row, from the query-block centroid
         var = (centroid_thr.pow(2) * kc_var.unsqueeze(1)).sum(-1)  # (B, N, H)
-        thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
+        spread = torch.sqrt(var * log2s * log2s + 1e-6)                 # (B, N, H)
+        if tau_map is not None:
+            thr = tau_map.to(spread).t().unsqueeze(0) * spread          # (H, N) -> (1, N, H)
+        else:
+            thr = tau * spread
         exact = colmean > thr.permute(0, 2, 1).unsqueeze(-1)            # (B, H, NQ, N)
     exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
     exact |= ((idx >= sink_kv0) & (idx < sink_kv1)).view(1, 1, 1, n)
@@ -366,6 +374,7 @@ def _op_sol_attn(
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
     rotate: bool = False,
+    tau_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
@@ -376,6 +385,7 @@ def _op_sol_attn(
         "blk_cnt": blk_cnt,
         "qk_balance": qk_balance,
         "rotate": rotate,
+        "tau_map": tau_map,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -384,6 +394,6 @@ def _op_sol_attn(
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
                       key_bias, topk_ratio, tail, block_len, coarse_gate,
-                      token_aug=0, blk_cnt=None, qk_balance=False, rotate=False):
+                      token_aug=0, blk_cnt=None, qk_balance=False, rotate=False, tau_map=None):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

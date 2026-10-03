@@ -2278,6 +2278,7 @@ def sol_attn(
     blk_cnt: torch.Tensor | None = None,
     qk_balance: bool = False,
     rotate: bool = False,
+    tau_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -2308,6 +2309,9 @@ def sol_attn(
     if rotate:
         raise NotImplementedError(
             "sol_attn: rotate is not implemented on the HIP backend yet; pass False")
+    if tau_map is not None:
+        raise NotImplementedError(
+            "sol_attn: tau_map is not implemented on the HIP backend yet; pass None")
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")

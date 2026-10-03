@@ -36,7 +36,7 @@
 // link instead of corrupting at runtime.
 void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, void*,
                            void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                           void*, const void*, const void*,
+                           void*, const void*, const void*, const void*,
                            int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, float, float, int, int, int, cudaStream_t);
@@ -288,7 +288,7 @@ extern "C" void launch_sol_attn(
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
     int64_t vs_b, int64_t vs_t, int64_t vs_h,
-    int n_tok, int qk_balance, int rotate, cudaStream_t stream)
+    int n_tok, int qk_balance, int rotate, const void* tau_map, cudaStream_t stream)
 {
     if (head_dim != HD)
         throw std::runtime_error("sol_attn supports head_dim 128, got " + std::to_string(head_dim));
@@ -301,7 +301,7 @@ extern "C" void launch_sol_attn(
     launch_sol_preprocess(q, k, v, w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
                           w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr,
                           w + p.cen8, w + p.cens, w + p.vsc, w + p.qmean, w + p.scratch,
-                          key_bias, blen,
+                          key_bias, blen, tau_map,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
                           tau, scale_log2, elem, qk_balance, rotate, stream);

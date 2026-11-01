@@ -8,6 +8,7 @@ from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import memmove_ as _memmove_
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -19,7 +20,7 @@ from .exceptions import (
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
 from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
-from .flash_attention import flash_attention_decode_step_merge
+from .flash_attention import flash_attention_decode_step_merge, flash_attention_decode_tree_merge
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
@@ -58,14 +59,17 @@ if getattr(torch.version, "hip", None):
     if registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
         sol_attn_chunked = _hip_backend.sol_attn_chunked
+        _memmove_ = _hip_backend.memmove_
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
 __all__ = [
     # Normalization
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
+    "group_norm_stats3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -77,6 +81,7 @@ __all__ = [
     "flash_attention_decode_gqa",
     "flash_attention_decode_gqa_is_available",
     "flash_attention_decode_step_merge",
+    "flash_attention_decode_tree_merge",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
@@ -115,6 +120,8 @@ __all__ = [
     "gemv_awq_w4a16",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
@@ -137,6 +144,7 @@ __all__ = [
     "delaunay3d",
     "mesh_bvh",
     "closest_point_on_mesh",
+    "closest_hit_on_mesh",
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
@@ -145,6 +153,7 @@ __all__ = [
     "to_blocked",
     "from_blocked",
     "set_allocation_context",
+    "memmove",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
@@ -163,6 +172,12 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def _call_backend(name: str, kwargs: dict):
+    """Dispatch a thin public wrapper whose signature matches its backends."""
+    impl = registry.get_implementation(name, kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def sol_attn(
@@ -279,6 +294,13 @@ def sol_attn(
         bool(rotate),
         tau_map,
     )
+
+
+def memmove(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes into dst in place; the two ranges may overlap."""
+    if dst.device.type == "cuda" and registry.is_available("hip" if torch.version.hip else "cuda"):
+        return _memmove_(dst, src)
+    dst.copy_(src.clone())
 
 
 def sol_attn_is_available(device: torch.device | None = None) -> bool:
@@ -417,20 +439,29 @@ def group_norm_silu_pad3d(
     silu: bool = True,
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
     x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
     reflects, or is zero when zero_pad; the front frames are always zero. weight=None is
-    pad-only. Output is channels_last_3d, into out when given, which is returned; for a
-    batch of one out may be a frame-offset view, leaving room for a caller's real halo.
+    pad-only. stats from group_norm_stats3d normalizes with those per-frame statistics
+    instead of x's own, so x may be a row strip of the frame they describe. Output is
+    channels_last_3d, into out when given, which is returned; for a batch of one out may
+    be a frame-offset view, leaving room for a caller's real halo.
     """
     if out is None:
         return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
-            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad)
+            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, stats)
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
-        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out)
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats)
     return out
+
+
+def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6) -> torch.Tensor:
+    """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
+    of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
+    return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
 
 
 def rms_adaln(
@@ -1025,6 +1056,29 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _mm_int8(a, b)
 
 
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """Compute ``residual + gate * rms_norm(activation, norm_weight)``.
+
+    Each step is rounded to the input dtype as in the unfused PyTorch ops.
+    """
+    return _call_backend(
+        "rms_gated_residual",
+        {
+            "activation": activation,
+            "norm_weight": norm_weight,
+            "residual": residual,
+            "gate": gate,
+            "eps": eps,
+        },
+    )
+
+
 def fp16_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1126,6 +1180,66 @@ def int8_linear(
     return impl(**kwargs)
 
 
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Batch-one modulation with fused INT8 quantization."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 projection with RMSNorm and batch-one modulation in its producer."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_rms_modulated",
+        {
+            "x": x,
+            "norm_weight": norm_weight,
+            "norm_eps": norm_eps,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
+
+
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """3D Delaunay tetrahedralization of distinct points (N, 3) float32/float64.
 
@@ -1146,7 +1260,7 @@ def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
 
 
 def mesh_bvh(triangles: torch.Tensor):
-    """Linear BVH over triangles (F, 3, 3) float32 for closest_point_on_mesh.
+    """Linear BVH over triangles (F, 3, 3) float32 for closest_point_on_mesh and closest_hit_on_mesh.
 
     Returns a reusable tuple (triangles in Morton order, their original ids, child links,
     node boxes).
@@ -1167,6 +1281,22 @@ def closest_point_on_mesh(
     """
     kwargs = {"bvh": bvh, "points": points, "max_dist": max_dist}
     impl = registry.get_implementation("closest_point_on_mesh", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def closest_hit_on_mesh(
+    bvh, origins: torch.Tensor, directions: torch.Tensor, tmin: float = 0.0, tmax: float = float("inf"),
+    cull_backface: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nearest hit on the `bvh` mesh of each ray origins + t * directions, (N, 3) float32, for t in (tmin, tmax).
+
+    Triangles are double-sided unless cull_backface, which keeps those whose winding normal faces the ray; edges
+    count as inside. Returns (t (N,) float32, triangle id (N,) int64 into the triangles given to mesh_bvh); rays
+    that hit nothing get t = tmax and triangle -1.
+    """
+    kwargs = {"bvh": bvh, "origins": origins, "directions": directions, "tmin": tmin, "tmax": tmax,
+              "cull_backface": cull_backface}
+    impl = registry.get_implementation("closest_hit_on_mesh", kwargs=kwargs)
     return impl(**kwargs)
 
 

@@ -3001,11 +3001,22 @@ def _check_coarse_gate(coarse_gate, shape, device):
     return coarse_gate
 
 
-def _topk_threshold(q, k, topk_ratio, scale, lengths, valid, sinks):
-    """Top-k threshold from post-rope q/k, pooled and quantized like prep_q."""
+def _sol_rotate(x):
+    """``x @ R`` on the channel axis, fp32: the fixed rotation the kernels apply
+    under ``rotate`` (sol_layout.cuh; the eager reference holds the matrix)."""
+    from comfy_kitchen.backends.eager.sol_attn import rotation_matrix
+    return x @ rotation_matrix(x.device)
+
+
+def _topk_threshold(q, k, topk_ratio, scale, lengths, valid, sinks, rotate=False):
+    """Top-k threshold from post-rope q/k, pooled and quantized like prep_q.
+    Under ``rotate`` the route kernel scores rotated centroids against rotated
+    pooled keys, so this replica quantizes the rotated means too."""
     cen = _block_means(q, lengths, valid)
     kc = _block_means(k, lengths, valid)
     kc = kc - kc.mean(dim=1, keepdim=True)
+    if rotate:
+        cen, kc = _sol_rotate(cen), _sol_rotate(kc)
     csc = (cen.abs().amax(-1, True) / 127.0).clamp_min(1e-8)      # prep_q
     c8 = torch.round(cen / csc).clamp_(-127, 127)
     return _topk_from_pooled(c8, csc.squeeze(-1), kc, topk_ratio, scale * _LOG2E, sinks)
@@ -3149,7 +3160,7 @@ def sol_attn(
     p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     # after the large buffers so its temporaries don't fragment the cache they reuse
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb, rotate=bool(rotate))
            if topk_ratio else None)
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -3298,7 +3309,8 @@ def sol_attn_chunked(
     kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32)
     vamax = torch.empty(h, d, device=dev, dtype=torch.float32)
     # after out, as in sol_attn
-    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
+    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb,
+                                                rotate=bool(rotate))
                  if topk_ratio else None)
     _C.sol_attn_core(
         _wrap_for_dlpack(ws), _wrap_for_dlpack(out), _wrap_for_dlpack(vscale),
@@ -3340,13 +3352,17 @@ def _ws_block_means(ws, p, bh, lengths):
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
 
 
-def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
-    """Producer-path top-k threshold from the workspace's own pooled outputs."""
+def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks, rotate=False):
+    """Producer-path top-k threshold from the workspace's own pooled outputs.
+    Under ``rotate`` the centroid bytes in the workspace are already rotated
+    and the key sums are not, so the keys are rotated here to meet them."""
     ntb, d = p["NTB"], _SOL_HD
     cen8 = ws[p["cen8"]:p["cen8"] + h * ntb * d].view(torch.int8).view(h, ntb, d).float()
     cens = ws[p["cens"]:p["cens"] + h * ntb * 4].view(torch.float32).view(h, ntb)
     kc = _ws_ksums(ws, p, h) / lengths.view(1, -1, 1)
     kc = kc - kc.mean(dim=1, keepdim=True)
+    if rotate:
+        kc = _sol_rotate(kc)
     # cen8 is stored perm_d'd; gathering AT perm_d recovers channel order
     # (perm_d is not an involution, so unpermute this side, not k8)
     cen8 = cen8[:, :, _perm_d_index(ws.device)]

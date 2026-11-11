@@ -1671,3 +1671,29 @@ def test_tau_map_is_checked():
         ck.sol_attn(q, k, v, tau_map=torch.ones((4, 3), device=q.device))
     with pytest.raises(ValueError):
         ck.sol_attn(q, k, v, tau_map=torch.ones((4, _nq(1024)), device=q.device), topk_ratio=0.2)
+
+
+def test_rotate_topk_threshold_is_in_the_rotated_space():
+    """Top-k selects by a threshold the Python layer computes as a replica of
+    the route kernel's int8 scores. Under `rotate` the kernel scores rotated
+    centroids against rotated pooled keys, so the replica must rotate too:
+    direct, both its operands; chunked, the keys, since the workspace's
+    centroid bytes are already rotated. Delete either and the threshold is
+    taken in the wrong space: with a loud K channel the direct path gets worse
+    than plain, and the producer parts from the direct path altogether."""
+    g = torch.Generator(device="cuda").manual_seed(23)
+    t, h, d, rot = 4096, 4, HD, 96
+    qkv = torch.randn(t, 3 * h * d, device="cuda", dtype=torch.bfloat16, generator=g)
+    freqs = torch.randn(1, t, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw[82] *= 12.0          # a loud K channel, through the norm weight both paths share
+    q, k, v = (x.reshape(1, t, h, d).clone() for x in qkv.split(h * d, dim=-1))
+    ck.rms_rope_split_half_(q, k, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
+    ref = sol_attn_eager(q, k, v, topk_ratio=0.2)
+    plain = ck.sol_attn(q, k, v, topk_ratio=0.2)
+    direct = ck.sol_attn(q, k, v, topk_ratio=0.2, rotate=True)
+    assert _rel_l2(direct, ref) <= _rel_l2(plain, ref), (_rel_l2(plain, ref), _rel_l2(direct, ref))
+    prod = backend.sol_attn_chunked(list(qkv.split(1024)), t, h, freqs, (qw, kw),
+                                    topk_ratio=0.2, rotate=True)[0]
+    assert _rel_l2(prod, direct) < 0.15, _rel_l2(prod, direct)

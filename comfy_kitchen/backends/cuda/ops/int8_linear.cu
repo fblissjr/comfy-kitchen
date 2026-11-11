@@ -1221,6 +1221,9 @@ __device__ __forceinline__ float stable_tanh(float x) {
 // at `in_row`. For SwiGLU and SiTU the raw row is 2*K wide (SwiGLU's gate in the
 // first half, SiTU's in the second); every other activation reads the same
 // K-wide row it writes.
+// Defined below with the cluster quantizer; torch's own SiLU, bit for bit.
+__device__ __forceinline__ float torch_silu(float x);
+
 template<int ACT, typename InputType>
 __device__ __forceinline__ float load_input_act(
     const InputType* __restrict__ x, int64_t in_row, int col, int K)
@@ -1232,8 +1235,7 @@ __device__ __forceinline__ float load_input_act(
         // scale moves the whole INT8 row.
         const float gate = to_float(x[in_row + col]);
         const float up = to_float(x[in_row + K + col]);
-        const float silu = gate / (1.0f + expf(-gate));
-        const float silu_r = to_float(from_float<InputType>(silu));
+        const float silu_r = to_float(from_float<InputType>(torch_silu(gate)));
         return to_float(from_float<InputType>(silu_r * up));
     } else if constexpr (ACT == kActSiTU) {
         // Matches torch 4 * tanh(gate / 4) * sigmoid(gate) * (25 * tanh(hidden / 25)).
